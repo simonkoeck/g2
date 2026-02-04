@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,20 +18,305 @@ import (
 	"github.com/simonkoeck/g2/pkg/ui"
 )
 
+// Version is set at build time
+var Version = "dev"
+
+// OperationType represents the type of git operation
+type OperationType int
+
+const (
+	OpMerge OperationType = iota
+	OpRebase
+	OpCherryPick
+)
+
+func (o OperationType) String() string {
+	switch o {
+	case OpMerge:
+		return "merge"
+	case OpRebase:
+		return "rebase"
+	case OpCherryPick:
+		return "cherry-pick"
+	default:
+		return "unknown"
+	}
+}
+
 // Package-level git executor (replaceable for testing)
 var gitExec git.Executor = git.NewDefaultExecutor()
 
 func main() {
 	args := os.Args[1:]
 
-	// If no args or not a merge command, passthrough to git
-	if len(args) == 0 || args[0] != "merge" {
+	// Handle global flags first
+	if len(args) > 0 {
+		switch args[0] {
+		case "--help", "-h", "help":
+			printHelp()
+			return
+		case "--version", "-V", "version":
+			fmt.Printf("g2 version %s\n", Version)
+			return
+		}
+	}
+
+	// If no args, check if we're in the middle of an operation
+	if len(args) == 0 {
+		if op := detectInProgressOperation(); op != nil {
+			os.Exit(handleInProgressOperation(*op))
+		}
 		passthrough("git", args...)
 		return
 	}
 
-	// Smart merge mode
-	os.Exit(smartMerge(args))
+	// Route to appropriate handler
+	switch args[0] {
+	case "merge":
+		os.Exit(smartMerge(args))
+	case "rebase":
+		os.Exit(smartRebase(args))
+	case "cherry-pick":
+		os.Exit(smartCherryPick(args))
+	case "continue":
+		// g2 continue - continue any in-progress operation
+		os.Exit(continueOperation())
+	case "abort":
+		// g2 abort - abort any in-progress operation
+		os.Exit(abortOperation())
+	case "status":
+		// g2 status - show current operation status
+		os.Exit(showStatus())
+	default:
+		passthrough("git", args...)
+	}
+}
+
+func printHelp() {
+	help := `G2 - Smart Git with Semantic Conflict Resolution
+
+USAGE:
+    g2 <command> [options] [args]
+
+COMMANDS:
+    merge <branch>       Merge a branch with semantic conflict resolution
+    rebase <branch>      Rebase onto a branch with semantic conflict resolution
+    cherry-pick <commit> Cherry-pick commits with semantic conflict resolution
+    continue             Continue an in-progress operation after resolving conflicts
+    abort                Abort an in-progress operation
+    status               Show current operation status
+    help                 Show this help message
+    version              Show version information
+
+    Any other command is passed through to git.
+
+OPTIONS:
+    --dry-run            Show what would be done without making changes
+    --json               Output results as JSON
+    --verbose, -v        Show detailed progress
+    --no-backup          Don't create .orig backup files
+    --log-level=LEVEL    Set log level (debug, info, warn, error)
+    --timeout=DURATION   Set git command timeout (e.g., 30s, 1m)
+
+EXAMPLES:
+    g2 merge feature-branch
+    g2 rebase main
+    g2 cherry-pick abc123
+    g2 merge --dry-run feature-branch
+    g2 merge --json feature-branch | jq .
+
+G2 automatically detects and resolves:
+    - Function/class moves and renames
+    - Identical changes made in both branches
+    - Formatting-only differences
+    - Inter-file moves with import updates
+`
+	fmt.Print(help)
+}
+
+// InProgressOperation represents an ongoing git operation
+type InProgressOperation struct {
+	Type    OperationType
+	GitDir  string
+	RepoDir string
+}
+
+// detectInProgressOperation checks if there's an ongoing merge/rebase/cherry-pick
+func detectInProgressOperation() *InProgressOperation {
+	ctx := context.Background()
+
+	gitDirOutput, err := gitExec.Output(ctx, "rev-parse", "--git-dir")
+	if err != nil {
+		return nil
+	}
+	gitDir := strings.TrimSpace(string(gitDirOutput))
+
+	repoOutput, err := gitExec.Output(ctx, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return nil
+	}
+	repoDir := strings.TrimSpace(string(repoOutput))
+
+	// Check for rebase in progress
+	if fileExists(filepath.Join(gitDir, "rebase-merge")) ||
+		fileExists(filepath.Join(gitDir, "rebase-apply")) {
+		return &InProgressOperation{Type: OpRebase, GitDir: gitDir, RepoDir: repoDir}
+	}
+
+	// Check for cherry-pick in progress
+	if fileExists(filepath.Join(gitDir, "CHERRY_PICK_HEAD")) {
+		return &InProgressOperation{Type: OpCherryPick, GitDir: gitDir, RepoDir: repoDir}
+	}
+
+	// Check for merge in progress
+	if fileExists(filepath.Join(gitDir, "MERGE_HEAD")) {
+		return &InProgressOperation{Type: OpMerge, GitDir: gitDir, RepoDir: repoDir}
+	}
+
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// handleInProgressOperation handles when g2 is called with no args during an operation
+func handleInProgressOperation(op InProgressOperation) int {
+	ui.Header("G2 Smart " + strings.Title(op.Type.String()))
+	ui.Info(fmt.Sprintf("Detected %s in progress", op.Type.String()))
+	fmt.Println()
+
+	// Check for conflicts
+	conflictingFiles, err := semantic.GetConflictingFiles()
+	if err != nil {
+		ui.Error(fmt.Sprintf("Failed to check conflicts: %v", err))
+		return exitcode.GitError
+	}
+
+	if len(conflictingFiles) > 0 {
+		ui.Warning(fmt.Sprintf("Found %d file(s) with conflicts", len(conflictingFiles)))
+		fmt.Println()
+		ui.Info("Run 'g2 continue' after resolving conflicts, or 'g2 abort' to cancel")
+		return exitcode.ConflictsRemain
+	}
+
+	ui.Success("No conflicts detected")
+	ui.Info(fmt.Sprintf("Run 'g2 continue' to finish the %s", op.Type.String()))
+	return exitcode.Success
+}
+
+// continueOperation continues any in-progress operation
+func continueOperation() int {
+	op := detectInProgressOperation()
+	if op == nil {
+		ui.Error("No operation in progress")
+		return exitcode.GitError
+	}
+
+	ctx := context.Background()
+	config := parseGlobalConfig([]string{})
+
+	// First, try to resolve any remaining conflicts
+	conflictingFiles, _ := semantic.GetConflictingFiles()
+	if len(conflictingFiles) > 0 {
+		ui.Header("G2 Smart " + strings.Title(op.Type.String()))
+		ui.Step("Resolving remaining conflicts...")
+
+		exitCode := resolveConflicts(ctx, config, op.Type)
+		if exitCode != exitcode.Success {
+			return exitCode
+		}
+	}
+
+	// Now continue the operation
+	var args []string
+	switch op.Type {
+	case OpMerge:
+		// For merge, just commit if all conflicts are resolved
+		args = []string{"commit", "--no-edit"}
+	case OpRebase:
+		args = []string{"rebase", "--continue"}
+	case OpCherryPick:
+		args = []string{"cherry-pick", "--continue"}
+	}
+
+	ui.Step(fmt.Sprintf("Continuing %s...", op.Type.String()))
+	err := gitExec.RunWithStdio(ctx, args...)
+	if err != nil {
+		// Check if there are still conflicts
+		if files, _ := semantic.GetConflictingFiles(); len(files) > 0 {
+			ui.Warning("Conflicts still remain - resolve them and run 'g2 continue'")
+			return exitcode.ConflictsRemain
+		}
+		ui.Error(fmt.Sprintf("Failed to continue %s: %v", op.Type.String(), err))
+		return exitcode.GitError
+	}
+
+	ui.Success(fmt.Sprintf("%s completed!", strings.Title(op.Type.String())))
+	return exitcode.Success
+}
+
+// abortOperation aborts any in-progress operation
+func abortOperation() int {
+	op := detectInProgressOperation()
+	if op == nil {
+		ui.Error("No operation in progress")
+		return exitcode.GitError
+	}
+
+	ctx := context.Background()
+	var args []string
+	switch op.Type {
+	case OpMerge:
+		args = []string{"merge", "--abort"}
+	case OpRebase:
+		args = []string{"rebase", "--abort"}
+	case OpCherryPick:
+		args = []string{"cherry-pick", "--abort"}
+	}
+
+	ui.Step(fmt.Sprintf("Aborting %s...", op.Type.String()))
+	err := gitExec.RunWithStdio(ctx, args...)
+	if err != nil {
+		ui.Error(fmt.Sprintf("Failed to abort %s: %v", op.Type.String(), err))
+		return exitcode.GitError
+	}
+
+	ui.Success(fmt.Sprintf("%s aborted", strings.Title(op.Type.String())))
+	return exitcode.Success
+}
+
+// showStatus shows current operation status
+func showStatus() int {
+	op := detectInProgressOperation()
+
+	if op == nil {
+		ui.Info("No operation in progress")
+		// Pass through to git status
+		passthrough("git", "status")
+		return exitcode.Success
+	}
+
+	ui.Header("G2 Status")
+	ui.Info(fmt.Sprintf("Operation: %s in progress", op.Type.String()))
+
+	conflictingFiles, _ := semantic.GetConflictingFiles()
+	if len(conflictingFiles) > 0 {
+		fmt.Println()
+		ui.Warning(fmt.Sprintf("Conflicting files (%d):", len(conflictingFiles)))
+		for _, f := range conflictingFiles {
+			fmt.Printf("  - %s\n", f)
+		}
+		fmt.Println()
+		ui.Info("Run 'g2 continue' to resolve and continue, or 'g2 abort' to cancel")
+	} else {
+		fmt.Println()
+		ui.Success("All conflicts resolved")
+		ui.Info(fmt.Sprintf("Run 'g2 continue' to finish the %s", op.Type.String()))
+	}
+
+	return exitcode.Success
 }
 
 // passthrough replaces the current process with git
@@ -41,8 +327,6 @@ func passthrough(cmd string, args ...string) {
 		os.Exit(exitcode.GitError)
 	}
 
-	// syscall.Exec replaces the current process entirely
-	// This preserves stdin/stdout/stderr, colors, and interactivity
 	execArgs := append([]string{cmd}, args...)
 	if err := syscall.Exec(gitPath, execArgs, os.Environ()); err != nil {
 		ui.Error(fmt.Sprintf("Failed to exec %s: %v", cmd, err))
@@ -50,14 +334,9 @@ func passthrough(cmd string, args ...string) {
 	}
 }
 
-// smartMerge runs git merge with semantic conflict analysis
-// Returns the exit code to use
-func smartMerge(args []string) int {
-	ctx := context.Background()
-
-	// Parse g2-specific flags and filter them out for git
+// parseGlobalConfig parses g2-specific flags from args
+func parseGlobalConfig(args []string) semantic.MergeConfig {
 	config := semantic.DefaultMergeConfig()
-	var gitArgs []string
 	for _, arg := range args {
 		switch {
 		case arg == "--dry-run":
@@ -74,32 +353,56 @@ func smartMerge(args []string) int {
 			if d, err := time.ParseDuration(strings.TrimPrefix(arg, "--timeout=")); err == nil {
 				config.GitTimeout = d
 			}
+		}
+	}
+	return config
+}
+
+// filterG2Flags removes g2-specific flags from args, returning git args
+func filterG2Flags(args []string) []string {
+	var gitArgs []string
+	for _, arg := range args {
+		switch {
+		case arg == "--dry-run",
+			arg == "--verbose", arg == "-v",
+			arg == "--no-backup",
+			arg == "--json",
+			strings.HasPrefix(arg, "--log-level="),
+			strings.HasPrefix(arg, "--timeout="):
+			// Skip g2-specific flags
 		default:
 			gitArgs = append(gitArgs, arg)
 		}
 	}
+	return gitArgs
+}
 
-	// Initialize logging
+// initConfig initializes logging and executor based on config
+func initConfig(config semantic.MergeConfig) {
 	logging.Init(logging.Config{
 		Level:      logging.ParseLevel(config.LogLevel),
 		JSONFormat: config.JSONOutput,
 	})
 
-	// Update git executor timeout if a custom timeout was specified via flag
-	// (config.GitTimeout defaults to DefaultTimeout, so only update if different)
 	if config.GitTimeout > 0 && config.GitTimeout != git.DefaultTimeout {
 		gitExec = git.NewExecutorWithTimeout(config.GitTimeout)
 		semantic.SetGitExecutor(gitExec)
 	}
+}
 
-	// Initialize JSON result if needed
+// smartMerge runs git merge with semantic conflict analysis
+func smartMerge(args []string) int {
+	ctx := context.Background()
+	config := parseGlobalConfig(args)
+	gitArgs := filterG2Flags(args)
+	initConfig(config)
+
 	var jsonResult *output.MergeResult
 	if config.JSONOutput {
 		jsonResult = output.NewMergeResult()
 		jsonResult.DryRun = config.DryRun
 	}
 
-	// Check if we're in a git repo
 	if !isGitRepo(ctx) {
 		if config.JSONOutput {
 			jsonResult.SetError(fmt.Errorf("not a git repository"))
@@ -110,116 +413,225 @@ func smartMerge(args []string) int {
 		return exitcode.NotGitRepo
 	}
 
-	// Display header (unless JSON output)
 	if !config.JSONOutput {
 		ui.Header("G2 Smart Merge")
-	}
-
-	// In dry-run mode, we still need to run git merge to detect conflicts
-	// but we won't write any synthesized changes
-	if config.DryRun && !config.JSONOutput {
-		ui.Info("Dry-run mode: no files will be modified")
-		fmt.Println()
-	}
-
-	// Run git merge
-	if !config.JSONOutput {
+		if config.DryRun {
+			ui.Info("Dry-run mode: no files will be modified")
+			fmt.Println()
+		}
 		ui.Step("Running git merge...")
 	}
 	logging.Debug("running git merge", "args", gitArgs)
 
 	err := gitExec.RunWithStdio(ctx, gitArgs...)
+	return handleOperationResult(ctx, config, jsonResult, err, OpMerge)
+}
 
+// smartRebase runs git rebase with semantic conflict analysis
+func smartRebase(args []string) int {
+	ctx := context.Background()
+	config := parseGlobalConfig(args)
+	gitArgs := filterG2Flags(args)
+	initConfig(config)
+
+	var jsonResult *output.MergeResult
+	if config.JSONOutput {
+		jsonResult = output.NewMergeResult()
+		jsonResult.DryRun = config.DryRun
+	}
+
+	if !isGitRepo(ctx) {
+		if config.JSONOutput {
+			jsonResult.SetError(fmt.Errorf("not a git repository"))
+			output.WriteJSONStdout(jsonResult)
+		} else {
+			ui.Error("Not a git repository")
+		}
+		return exitcode.NotGitRepo
+	}
+
+	// Check for --continue, --abort, --skip
+	for _, arg := range gitArgs {
+		switch arg {
+		case "--continue":
+			return continueOperation()
+		case "--abort":
+			return abortOperation()
+		case "--skip":
+			// Pass through to git
+			if !config.JSONOutput {
+				ui.Step("Skipping current commit...")
+			}
+			if err := gitExec.RunWithStdio(ctx, gitArgs...); err != nil {
+				return exitcode.GitError
+			}
+			return exitcode.Success
+		}
+	}
+
+	if !config.JSONOutput {
+		ui.Header("G2 Smart Rebase")
+		if config.DryRun {
+			ui.Info("Dry-run mode: no files will be modified")
+			fmt.Println()
+		}
+		ui.Step("Running git rebase...")
+	}
+	logging.Debug("running git rebase", "args", gitArgs)
+
+	err := gitExec.RunWithStdio(ctx, gitArgs...)
+	return handleOperationResult(ctx, config, jsonResult, err, OpRebase)
+}
+
+// smartCherryPick runs git cherry-pick with semantic conflict analysis
+func smartCherryPick(args []string) int {
+	ctx := context.Background()
+	config := parseGlobalConfig(args)
+	gitArgs := filterG2Flags(args)
+	initConfig(config)
+
+	var jsonResult *output.MergeResult
+	if config.JSONOutput {
+		jsonResult = output.NewMergeResult()
+		jsonResult.DryRun = config.DryRun
+	}
+
+	if !isGitRepo(ctx) {
+		if config.JSONOutput {
+			jsonResult.SetError(fmt.Errorf("not a git repository"))
+			output.WriteJSONStdout(jsonResult)
+		} else {
+			ui.Error("Not a git repository")
+		}
+		return exitcode.NotGitRepo
+	}
+
+	// Check for --continue, --abort
+	for _, arg := range gitArgs {
+		switch arg {
+		case "--continue":
+			return continueOperation()
+		case "--abort":
+			return abortOperation()
+		}
+	}
+
+	if !config.JSONOutput {
+		ui.Header("G2 Smart Cherry-Pick")
+		if config.DryRun {
+			ui.Info("Dry-run mode: no files will be modified")
+			fmt.Println()
+		}
+		ui.Step("Running git cherry-pick...")
+	}
+	logging.Debug("running git cherry-pick", "args", gitArgs)
+
+	err := gitExec.RunWithStdio(ctx, gitArgs...)
+	return handleOperationResult(ctx, config, jsonResult, err, OpCherryPick)
+}
+
+// handleOperationResult handles the result of a git operation (merge/rebase/cherry-pick)
+func handleOperationResult(ctx context.Context, config semantic.MergeConfig, jsonResult *output.MergeResult, err error, opType OperationType) int {
 	if err == nil {
-		// Merge succeeded without conflicts
 		if config.JSONOutput {
 			jsonResult.Success = true
 			output.WriteJSONStdout(jsonResult)
 		} else {
 			fmt.Println()
-			ui.Success("Merge completed successfully!")
+			ui.Success(fmt.Sprintf("%s completed successfully!", strings.Title(opType.String())))
 		}
 		return exitcode.Success
 	}
 
 	// Check for timeout
 	if git.IsTimeoutError(err) {
-		logging.Error("git merge timed out", "error", err)
+		logging.Error("git operation timed out", "operation", opType.String(), "error", err)
 		if config.JSONOutput {
-			jsonResult.SetError(fmt.Errorf("git merge timed out"))
+			jsonResult.SetError(fmt.Errorf("git %s timed out", opType.String()))
 			output.WriteJSONStdout(jsonResult)
 		} else {
-			ui.Error("Git merge timed out")
+			ui.Error(fmt.Sprintf("Git %s timed out", opType.String()))
 		}
 		return exitcode.TimeoutError
 	}
 
-	// Check exit code - handle both *exec.ExitError and any error with ExitCode() method
+	// Check exit code
 	type exitCoder interface {
 		ExitCode() int
 	}
-	var mergeExitCode int
+	var opExitCode int
 	if exitErr, ok := err.(*exec.ExitError); ok {
-		mergeExitCode = exitErr.ExitCode()
+		opExitCode = exitErr.ExitCode()
 	} else if ec, ok := err.(exitCoder); ok {
-		mergeExitCode = ec.ExitCode()
+		opExitCode = ec.ExitCode()
 	} else {
-		logging.Error("merge failed with unexpected error", "error", err)
+		logging.Error("operation failed with unexpected error", "operation", opType.String(), "error", err)
 		if config.JSONOutput {
-			jsonResult.SetError(fmt.Errorf("merge failed: %v", err))
+			jsonResult.SetError(fmt.Errorf("%s failed: %v", opType.String(), err))
 			output.WriteJSONStdout(jsonResult)
 		} else {
-			ui.Error(fmt.Sprintf("Merge failed: %v", err))
+			ui.Error(fmt.Sprintf("%s failed: %v", strings.Title(opType.String()), err))
 		}
 		return exitcode.GitError
 	}
-	if mergeExitCode != 1 {
-		// Exit code other than 1 indicates a different error
-		logging.Error("git merge failed with exit code", "exit_code", mergeExitCode)
+
+	// For rebase/cherry-pick, exit code 1 or 128 can indicate conflicts
+	// For merge, exit code 1 indicates conflicts
+	if opExitCode != 1 && !(opType != OpMerge && opExitCode == 128) {
+		logging.Error("git operation failed", "operation", opType.String(), "exit_code", opExitCode)
 		if config.JSONOutput {
-			jsonResult.SetError(fmt.Errorf("git merge failed with exit code %d", mergeExitCode))
+			jsonResult.SetError(fmt.Errorf("git %s failed with exit code %d", opType.String(), opExitCode))
 			output.WriteJSONStdout(jsonResult)
 		}
-		return mergeExitCode
+		return opExitCode
 	}
 
-	// Exit code 1 typically means conflicts
+	// Likely conflicts - try to resolve them
 	if !config.JSONOutput {
 		fmt.Println()
-		ui.Warning("Merge conflicts detected!")
+		ui.Warning("Conflicts detected!")
 		fmt.Println()
 	}
-	logging.Info("merge conflicts detected")
+	logging.Info("conflicts detected", "operation", opType.String())
 
-	// Get conflicting files
+	return resolveConflictsWithJSON(ctx, config, jsonResult, opType)
+}
+
+// resolveConflicts resolves conflicts without JSON tracking
+func resolveConflicts(ctx context.Context, config semantic.MergeConfig, opType OperationType) int {
+	return resolveConflictsWithJSON(ctx, config, nil, opType)
+}
+
+// resolveConflictsWithJSON resolves conflicts with optional JSON output
+func resolveConflictsWithJSON(ctx context.Context, config semantic.MergeConfig, jsonResult *output.MergeResult, opType OperationType) int {
 	if !config.JSONOutput {
 		ui.Step("Analyzing conflicts...")
 	}
+
 	conflictingFiles, err := semantic.GetConflictingFilesWithContext(ctx)
 	if err != nil {
 		logging.Error("failed to get conflicting files", "error", err)
-		if config.JSONOutput {
+		if config.JSONOutput && jsonResult != nil {
 			jsonResult.SetError(fmt.Errorf("failed to get conflicting files: %v", err))
 			output.WriteJSONStdout(jsonResult)
-		} else {
+		} else if !config.JSONOutput {
 			ui.Error(fmt.Sprintf("Failed to get conflicting files: %v", err))
 		}
 		return exitcode.GitError
 	}
 
 	if len(conflictingFiles) == 0 {
-		if config.JSONOutput {
+		if config.JSONOutput && jsonResult != nil {
 			jsonResult.SetError(fmt.Errorf("no conflicting files found"))
 			output.WriteJSONStdout(jsonResult)
-		} else {
-			ui.Info("No conflicting files found (merge may have failed for another reason)")
+		} else if !config.JSONOutput {
+			ui.Info("No conflicting files found (operation may have failed for another reason)")
 		}
 		return exitcode.GitError
 	}
 
-	// Analyze each file (use synthesis analysis for both display and synthesis)
+	// Analyze each file
 	synthesesByFile := make(map[string]*semantic.SynthesisAnalysis)
-
 	for _, file := range conflictingFiles {
 		if semantic.IsSemanticFile(file) {
 			synthesis := semantic.AnalyzeConflictForSynthesis(file)
@@ -227,7 +639,7 @@ func smartMerge(args []string) int {
 		}
 	}
 
-	// Detect inter-file moves across all analyses
+	// Detect inter-file moves
 	var allAnalyses []*semantic.SynthesisAnalysis
 	for _, a := range synthesesByFile {
 		allAnalyses = append(allAnalyses, a)
@@ -235,7 +647,7 @@ func smartMerge(args []string) int {
 	interFileMoves := semantic.DetectInterFileMoves(allAnalyses)
 	semantic.ApplyInterFileMoves(allAnalyses, interFileMoves)
 
-	// Find and apply import updates for inter-file moves
+	// Handle import updates for inter-file moves
 	if len(interFileMoves) > 0 && !config.DryRun {
 		repoRoot, _ := getRepoRoot(ctx)
 		if repoRoot != "" {
@@ -253,7 +665,6 @@ func smartMerge(args []string) int {
 				}
 				results := semantic.ApplyImportUpdates(importUpdates, repoRoot)
 
-				// Stage updated files
 				for _, result := range results {
 					if result.Error == nil && result.UpdatesCount > 0 {
 						if err := gitExec.Run(ctx, "add", result.File); err != nil {
@@ -274,7 +685,6 @@ func smartMerge(args []string) int {
 			}
 		}
 	} else if len(interFileMoves) > 0 && config.DryRun {
-		// In dry-run mode, show what imports would be updated
 		repoRoot, _ := getRepoRoot(ctx)
 		if repoRoot != "" {
 			importUpdates, _ := semantic.FindImportUpdates(interFileMoves, repoRoot)
@@ -286,7 +696,7 @@ func smartMerge(args []string) int {
 		}
 	}
 
-	// Now collect all conflicts for display (including non-semantic files)
+	// Collect all conflicts for display
 	var allConflicts []ui.Conflict
 	for _, file := range conflictingFiles {
 		if semantic.IsSemanticFile(file) {
@@ -300,13 +710,11 @@ func smartMerge(args []string) int {
 		}
 	}
 
-	// Display conflict table (unless JSON output)
 	if !config.JSONOutput {
 		fmt.Println()
 		ui.ConflictTable(allConflicts)
 	}
 
-	// Count conflicts needing resolution
 	needsResolution := 0
 	for _, c := range allConflicts {
 		if c.Status == "Needs Resolution" {
@@ -316,10 +724,6 @@ func smartMerge(args []string) int {
 
 	if !config.JSONOutput {
 		ui.Summary(needsResolution, len(allConflicts))
-	}
-
-	// Synthesize files
-	if !config.JSONOutput {
 		fmt.Println()
 		if config.DryRun {
 			ui.Step("Dry run - showing proposed changes...")
@@ -327,6 +731,7 @@ func smartMerge(args []string) int {
 			ui.Step("Synthesizing files...")
 		}
 	}
+
 	allAutoMerged := true
 	filesWithMarkers := 0
 
@@ -335,14 +740,13 @@ func smartMerge(args []string) int {
 			synthesis := synthesesByFile[file]
 			result := semantic.SynthesizeFile(synthesis, config)
 
-			// Add to JSON result if needed
-			if config.JSONOutput {
+			if config.JSONOutput && jsonResult != nil {
 				fileResult := output.FileResult{
-					File:           file,
-					ConflictCount:  result.ConflictCount,
-					ResolvedCount:  result.AutoMergeCount,
-					AllAutoMerged:  result.AllAutoMerged,
-					HasMarkers:     !result.AllAutoMerged && result.Success,
+					File:          file,
+					ConflictCount: result.ConflictCount,
+					ResolvedCount: result.AutoMergeCount,
+					AllAutoMerged: result.AllAutoMerged,
+					HasMarkers:    !result.AllAutoMerged && result.Success,
 				}
 				if result.Error != nil {
 					fileResult.Error = result.Error.Error()
@@ -362,8 +766,7 @@ func smartMerge(args []string) int {
 			}
 		} else {
 			allAutoMerged = false
-			// Add non-semantic file to JSON result
-			if config.JSONOutput {
+			if config.JSONOutput && jsonResult != nil {
 				jsonResult.AddFileResult(output.FileResult{
 					File:          file,
 					ConflictCount: 1,
@@ -373,44 +776,57 @@ func smartMerge(args []string) int {
 		}
 	}
 
-	// Final status
 	if !config.JSONOutput {
 		fmt.Println()
 	}
 
 	if config.DryRun {
-		// Abort the merge to restore repo state
-		if err := gitExec.Run(ctx, "merge", "--abort"); err != nil {
-			logging.Debug("merge abort failed (may not be in merge state)", "error", err)
+		// Abort the operation to restore repo state
+		var abortArgs []string
+		switch opType {
+		case OpMerge:
+			abortArgs = []string{"merge", "--abort"}
+		case OpRebase:
+			abortArgs = []string{"rebase", "--abort"}
+		case OpCherryPick:
+			abortArgs = []string{"cherry-pick", "--abort"}
 		}
-		if config.JSONOutput {
+		if err := gitExec.Run(ctx, abortArgs...); err != nil {
+			logging.Debug("abort failed (may not be in operation state)", "error", err)
+		}
+		if config.JSONOutput && jsonResult != nil {
 			jsonResult.Finalize()
 			output.WriteJSONStdout(jsonResult)
-		} else {
+		} else if !config.JSONOutput {
 			ui.Info("Dry run complete - no files were modified")
 		}
 		return exitcode.Success
-	} else if allAutoMerged && needsResolution == 0 {
-		if config.JSONOutput {
+	}
+
+	if allAutoMerged && needsResolution == 0 {
+		if config.JSONOutput && jsonResult != nil {
 			jsonResult.Finalize()
 			output.WriteJSONStdout(jsonResult)
-		} else {
+		} else if !config.JSONOutput {
 			ui.Success("All conflicts auto-merged and staged!")
-		}
-		return exitcode.Success
-	} else {
-		if !config.JSONOutput {
-			if filesWithMarkers > 0 {
-				ui.Info(fmt.Sprintf("%d file(s) have conflict markers - resolve manually", filesWithMarkers))
+			if opType != OpMerge {
+				ui.Info(fmt.Sprintf("Run 'g2 continue' to finish the %s", opType.String()))
 			}
 		}
-		if config.JSONOutput {
-			jsonResult.Finalize()
-			output.WriteJSONStdout(jsonResult)
-		}
-		// Exit with error code to indicate conflicts remain
-		return exitcode.ConflictsRemain
+		return exitcode.Success
 	}
+
+	if !config.JSONOutput {
+		if filesWithMarkers > 0 {
+			ui.Info(fmt.Sprintf("%d file(s) have conflict markers - resolve manually", filesWithMarkers))
+		}
+		ui.Info(fmt.Sprintf("Run 'g2 continue' to continue after resolving, or 'g2 abort' to cancel"))
+	}
+	if config.JSONOutput && jsonResult != nil {
+		jsonResult.Finalize()
+		output.WriteJSONStdout(jsonResult)
+	}
+	return exitcode.ConflictsRemain
 }
 
 // isGitRepo checks if the current directory is inside a git repository
@@ -437,4 +853,28 @@ func SmartMergeWithExecutor(args []string, exec git.Executor) int {
 		semantic.SetGitExecutor(oldExec)
 	}()
 	return smartMerge(args)
+}
+
+// SmartRebaseWithExecutor runs smart rebase with a custom executor (for testing)
+func SmartRebaseWithExecutor(args []string, exec git.Executor) int {
+	oldExec := gitExec
+	gitExec = exec
+	semantic.SetGitExecutor(exec)
+	defer func() {
+		gitExec = oldExec
+		semantic.SetGitExecutor(oldExec)
+	}()
+	return smartRebase(args)
+}
+
+// SmartCherryPickWithExecutor runs smart cherry-pick with a custom executor (for testing)
+func SmartCherryPickWithExecutor(args []string, exec git.Executor) int {
+	oldExec := gitExec
+	gitExec = exec
+	semantic.SetGitExecutor(exec)
+	defer func() {
+		gitExec = oldExec
+		semantic.SetGitExecutor(oldExec)
+	}()
+	return smartCherryPick(args)
 }
