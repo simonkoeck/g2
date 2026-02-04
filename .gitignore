@@ -4,3 +4,5 @@ g2
 # Nix build output
 result
 result-*
+
+test/

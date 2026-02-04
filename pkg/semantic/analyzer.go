@@ -214,7 +214,7 @@ func extractPythonDefinitions(node *sitter.Node, content []byte, defs *[]Definit
 }
 
 func extractPythonFunction(node *sitter.Node, content []byte) *Definition {
-	var name, params string
+	var name, params, body string
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
 		switch child.Type() {
@@ -222,16 +222,23 @@ func extractPythonFunction(node *sitter.Node, content []byte) *Definition {
 			name = child.Content(content)
 		case "parameters":
 			params = child.Content(content)
+		case "block":
+			// Extract just the function body (indented block), not the signature
+			body = child.Content(content)
 		}
 	}
 	if name == "" {
 		return nil
 	}
+	// If we couldn't extract the body separately, fall back to full node content
+	if body == "" {
+		body = node.Content(content)
+	}
 	return &Definition{
 		Name:      name,
 		Kind:      "function",
 		Signature: fmt.Sprintf("def %s%s", name, params),
-		Body:      node.Content(content),
+		Body:      body,
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
 		StartByte: node.StartByte(),
@@ -355,7 +362,7 @@ func extractJSDefinitions(node *sitter.Node, content []byte, defs *[]Definition)
 }
 
 func extractJSFunction(node *sitter.Node, content []byte) *Definition {
-	var name, params string
+	var name, params, body string
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
 		switch child.Type() {
@@ -363,16 +370,23 @@ func extractJSFunction(node *sitter.Node, content []byte) *Definition {
 			name = child.Content(content)
 		case "formal_parameters":
 			params = child.Content(content)
+		case "statement_block":
+			// Extract just the function body, not the signature
+			body = child.Content(content)
 		}
 	}
 	if name == "" {
 		return nil
 	}
+	// If we couldn't extract the body separately, fall back to full node content
+	if body == "" {
+		body = node.Content(content)
+	}
 	return &Definition{
 		Name:      name,
 		Kind:      "function",
 		Signature: fmt.Sprintf("function %s%s", name, params),
-		Body:      node.Content(content),
+		Body:      body,
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
 		StartByte: node.StartByte(),

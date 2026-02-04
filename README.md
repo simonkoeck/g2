@@ -1,18 +1,17 @@
-# 🚀 G2 - Smart Git Merge with Semantic Conflict Analysis
+# G2 - Semantic Git Merge
 
-Ever stared at a Git merge conflict and thought "okay but *what actually broke?*" — G2 is here to help! It's a drop-in Git replacement that intercepts merge commands and gives you intelligent, semantic-level conflict analysis. Instead of cryptic conflict markers, G2 tells you exactly **what** conflicted and **why**.
+A drop-in Git replacement that understands your code. G2 intercepts merge commands and provides intelligent, semantic-level conflict analysis with automatic resolution for common scenarios.
 
-## ✨ Features
+## Features
 
-- 🔄 **Drop-in Git replacement** — Use `g2` exactly like `git`, all commands pass through seamlessly
-- 🧠 **Semantic conflict detection** — Identifies conflicts at the function, class, interface, and key level
-- 🌍 **Multi-language support** — Works with Python, JavaScript, TypeScript, JSON, and YAML
-- 🎨 **Smart whitespace handling** — Detects when changes are semantically identical but differ only in formatting
-- 💅 **Beautiful terminal UI** — Styled output with Nerd Font icons and color-coded status
-- ⚡ **Auto-merge where possible** — Automatically resolves identical additions and formatting-only changes
-- 🛡️ **Safe by default** — Creates backup files and uses atomic writes to protect your code
+- **Drop-in Git replacement** - Use `g2` exactly like `git`, all commands pass through seamlessly
+- **Move/rename detection** - Automatically detects when functions are renamed or moved between files
+- **Semantic conflict analysis** - Identifies conflicts at the function, class, interface, and key level
+- **Interactive TUI** - Resolve conflicts visually with a terminal UI
+- **Smart auto-merge** - Automatically resolves identical changes, formatting differences, and delete-vs-rename conflicts
+- **Multi-language support** - Python, JavaScript, TypeScript, JSON, and YAML
 
-## 📦 Installation
+## Installation
 
 ### Building from source
 
@@ -23,182 +22,219 @@ go build -o g2 .
 
 # Install system-wide
 sudo cp g2 /usr/local/bin/
-
-# Or just add an alias to your shell config
-echo 'alias g2="/path/to/g2"' >> ~/.bashrc
 ```
 
-### Using Nix 🐧
-
-If you're a Nix user, there's a flake ready for you:
+### Using Nix
 
 ```bash
-# Build it
 nix build
-
-# Or jump into a dev shell
+# Or enter a dev shell
 nix develop
 ```
 
 ### Requirements
 
-- Go 1.21 or newer
-- Git (obviously!)
-- A terminal with Nerd Font support (optional, but makes things prettier)
+- Go 1.21+
+- Git
+- GCC (for tree-sitter CGO bindings)
 
-## 🎮 Usage
+## Usage
 
-Just use `g2` like you'd use `git` — it works the same way:
+Use `g2` exactly like `git`:
 
 ```bash
 g2 status
 g2 log --oneline -5
-g2 commit -m "feat: add cool feature"
+g2 commit -m "feat: add feature"
 g2 push origin main
 ```
 
-The magic happens when you merge:
+The magic happens on merge:
 
 ```bash
 g2 merge feature-branch
 ```
 
-### Command-line options 🛠️
+### Command-line options
 
-G2 adds a few handy flags on top of the standard git merge options:
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview changes without writing |
+| `--verbose` / `-v` | Show detailed analysis progress |
+| `--no-backup` | Skip creating `.orig` backup files |
 
-| Flag | What it does |
-|------|--------------|
-| `--dry-run` | Preview changes without actually writing anything |
-| `--verbose` / `-v` | Show detailed progress as G2 analyzes your conflicts |
-| `--no-backup` | Skip creating `.orig` backup files (useful for CI) |
+## Move Detection
 
-All the regular `git merge` flags work too — they just get passed through.
+G2's standout feature is detecting when code is renamed or moved. When one branch deletes a function and another branch renames it, G2 recognizes they're the same code and auto-merges:
 
-## 📺 Example Output
+**Scenario:**
+- Base: `def calc_total(items): ...`
+- Main branch: deletes `calc_total`
+- Feature branch: renames to `calculate_order_total(items): ...`
 
-When conflicts pop up, G2 gives you a nice semantic breakdown:
+**Result:** G2 detects this as "Delete vs Rename" and keeps the renamed version automatically.
+
+### How it works
+
+1. **Parse** - Tree-sitter extracts function/class definitions from base, local, and remote
+2. **Match** - Compares function bodies using Jaccard similarity (ignoring names)
+3. **Synthesize** - Generates merged output, auto-resolving where safe
+
+Match types:
+- **Exact Match** (100% body similarity) - Auto-merge
+- **Fuzzy Match** (>75% similarity) - Auto-merge with high confidence
+- **No Match** - Requires manual resolution
+
+## Interactive TUI
+
+When conflicts require manual resolution, G2 launches an interactive terminal UI:
 
 ```
-╭─────────────────╮
-│  G2 Smart Merge │
-╰─────────────────╯
+╭─────────────────────────────────────────────────────────────╮
+│                    Conflict Resolution                       │
+╰─────────────────────────────────────────────────────────────╯
 
- Running git merge...
- Merge conflicts detected!
- Analyzing conflicts...
+  Conflicts (3)
 
-╭──────────────┬─────────────────────────────┬──────────────────╮
-│  FILE        │ CONFLICT TYPE               │ STATUS           │
-├──────────────┼─────────────────────────────┼──────────────────┤
-│ app.py       │ Function 'process' Modified │ Needs Resolution │
-│ utils.ts     │ Interface 'User' Modified   │ Needs Resolution │
-│ config.json  │ Key 'version' Modified      │ Needs Resolution │
-│ helpers.js   │ Function 'format' Modified (same) │ Can Auto-merge │
-╰──────────────┴─────────────────────────────┴──────────────────╯
+  > utils.py: validate_email (Modified)        [Needs Resolution]
+    utils.py: process_order (Modified)         [Needs Resolution]
+    utils.py: calculate_shipping (Modified)    [Needs Resolution]
 
- 3 of 4 conflicts need manual resolution
+  ↑↓ navigate • Enter view • 1-5 resolve • a apply • q quit
 ```
 
-No more digging through files trying to figure out what went wrong!
+### TUI Controls
 
-## 🗣️ Supported Languages
+| Key | Action |
+|-----|--------|
+| `↑`/`k` | Move up |
+| `↓`/`j` | Move down |
+| `Enter` | View conflict details (3-panel diff) |
+| `1` | Keep Local version |
+| `2` | Keep Remote version |
+| `3` | Keep Both versions |
+| `4` | Keep Base version |
+| `5`/`s` | Skip (edit manually later) |
+| `a` | Apply all resolutions |
+| `q` | Quit/abort |
 
-| Language | Extensions | What G2 understands |
-|----------|------------|---------------------|
-| 🐍 Python | `.py` | Functions, Classes |
-| 🟨 JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | Functions, Classes, Arrow functions, Variables |
-| 🔷 TypeScript | `.ts`, `.mts`, `.cts`, `.tsx` | Functions, Classes, Interfaces, Type aliases |
-| 📋 JSON | `.json` | Top-level keys |
-| 📄 YAML | `.yaml`, `.yml` | Top-level keys |
+### Detail View
 
-For everything else, G2 falls back to standard "Text Conflict" detection — you're never left hanging.
+Pressing Enter shows a 3-panel view:
 
-## 🔍 Conflict Types
+```
+╭─ BASE ──────────────────────────────────────────────────────╮
+│ def validate_email(email):                                   │
+│     return "@" in email and "." in email                     │
+╰─────────────────────────────────────────────────────────────╯
+╭─ LOCAL ─────────────────────────────────────────────────────╮
+│ def validate_email(email):                                   │
+│     import re                                                │
+│     pattern = r'^[a-zA-Z0-9._%+-]+@...'                      │
+│     return bool(re.match(pattern, email or ''))              │
+╰─────────────────────────────────────────────────────────────╯
+╭─ REMOTE ────────────────────────────────────────────────────╮
+│ def validate_email(email):                                   │
+│     if not email or not isinstance(email, str):              │
+│         return False                                         │
+│     parts = email.split('@')                                 │
+│     ...                                                      │
+╰─────────────────────────────────────────────────────────────╯
+```
 
-G2 categorizes conflicts so you know exactly what you're dealing with:
+## Conflict Types
 
-| Type | What happened | Can auto-merge? |
-|------|---------------|-----------------|
-| `Modified` | Both branches changed the same thing differently | ❌ |
-| `Modified (same)` | Both branches made identical changes | ✅ |
-| `Formatted Change` | Same changes, just different whitespace | ✅ |
-| `Added (identical)` | Both branches added the exact same code | ✅ |
-| `Added (differs)` | Both branches added something with the same name, but different | ❌ |
-| `Delete/Modify` | One branch deleted it, the other modified it | ❌ |
-| `Modify/Delete` | One branch modified it, the other deleted it | ❌ |
-| `Text Conflict` | Standard conflict in unsupported file types | ❌ |
-| `Binary Conflict` | Binary file conflicts | ❌ |
+| Type | Description | Auto-merge? |
+|------|-------------|-------------|
+| `Modified` | Both branches changed differently | No |
+| `Modified (same)` | Both made identical changes | Yes |
+| `Formatted Change` | Same changes, different whitespace | Yes |
+| `Added (identical)` | Both added the same code | Yes |
+| `Added (differs)` | Both added different code with same name | No |
+| `Delete/Rename` | One deleted, other renamed | Yes |
+| `Delete/Modify` | One deleted, other modified | No |
 
-## ⚙️ How It Works
+## Supported Languages
 
-### 1. Passthrough Mode 🚦
+| Language | Extensions | Extracted Definitions |
+|----------|------------|----------------------|
+| Python | `.py` | Functions, Classes |
+| JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | Functions, Classes, Arrow functions |
+| TypeScript | `.ts`, `.mts`, `.cts`, `.tsx` | Functions, Classes, Interfaces, Types |
+| JSON | `.json` | Top-level keys |
+| YAML | `.yaml`, `.yml` | Top-level keys |
 
-For any command that's not a merge, G2 simply hands off to Git using `syscall.Exec`. This means colors, interactivity, stdin/stdout — everything works exactly as you'd expect. G2 gets out of the way.
+Unsupported files fall back to standard text conflict detection.
 
-### 2. Smart Merge Mode 🧠
+## Example Session
 
-When you run `g2 merge`, here's what happens behind the scenes:
+```bash
+$ cd my-project
+$ g2 merge feature/refactor
 
-1. G2 runs `git merge` and captures the result
-2. If conflicts occur, it grabs the base, local, and remote versions of each conflicting file
-3. Files are parsed using [Tree-sitter](https://tree-sitter.github.io/) grammars — real AST parsing, not regex hacks
-4. G2 extracts all the definitions (functions, classes, interfaces, keys, etc.)
-5. It compares definitions across all three versions to figure out the semantic conflicts
-6. Results are displayed in a beautiful, easy-to-read table
-7. Where possible, conflicts are auto-merged and staged for you
+Running git merge...
+Merge conflicts detected!
+Analyzing 1 conflicted file...
 
-### 3. Whitespace Normalization 🧹
+╭──────────┬─────────────────────────────────────┬────────────────╮
+│ FILE     │ CONFLICT                            │ STATUS         │
+├──────────┼─────────────────────────────────────┼────────────────┤
+│ utils.py │ calc_total → calculate_order_total  │ Auto: Rename   │
+│ utils.py │ fmt_price → format_currency         │ Auto: Rename   │
+│ utils.py │ validate_email (Modified)           │ Manual         │
+│ utils.py │ process_order (Modified)            │ Manual         │
+╰──────────┴─────────────────────────────────────┴────────────────╯
 
-G2 normalizes whitespace when comparing changes. So if you and your teammate both made the same fix but with different formatting (tabs vs spaces, trailing newlines, etc.), G2 recognizes they're semantically identical and auto-merges them. One less thing to argue about!
+2 conflicts auto-merged, 2 need resolution
 
-## 📁 Project Structure
+[TUI launches for manual conflicts...]
+```
+
+## Project Structure
 
 ```
 g2/
-├── main.go                        # Entry point & Git wrapper logic
+├── main.go                     # Entry point & Git wrapper
 ├── pkg/
 │   ├── semantic/
-│   │   ├── analyzer.go            # Tree-sitter parsing & conflict analysis
-│   │   ├── synthesize.go          # File synthesis & auto-merge logic
-│   │   └── synthesize_test.go     # Comprehensive test suite
+│   │   ├── analyzer.go         # Tree-sitter parsing
+│   │   ├── moves.go            # Move/rename detection
+│   │   ├── synthesize.go       # File synthesis & auto-merge
+│   │   └── *_test.go           # Test suites
+│   ├── tui/
+│   │   ├── model.go            # Bubbletea model
+│   │   ├── views.go            # UI rendering
+│   │   ├── resolver.go         # Conflict resolution logic
+│   │   └── styles.go           # Lipgloss styles
 │   └── ui/
-│       └── ui.go                  # Terminal UI components (lipgloss)
+│       └── ui.go               # Non-interactive output
+├── test/
+│   └── */setup.sh              # Test scenario generators
 ├── go.mod
-├── go.sum
-├── flake.nix                      # Nix flake for development
-├── shell.nix                      # Nix shell config
-└── README.md
+└── flake.nix
 ```
 
-## 🧪 Running Tests
+## Running Tests
 
 ```bash
 go test ./pkg/semantic -v
-go test ./pkg/ui -v
+go test ./pkg/tui -v
 ```
 
-The test suite covers collision detection, atomic file writes, conflict marker insertion, byte replacement logic, and more.
+## Dependencies
 
-## 📚 Dependencies
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea) - TUI framework
+- [Lip Gloss](https://github.com/charmbracelet/lipgloss) - Terminal styling
+- [go-tree-sitter](https://github.com/smacker/go-tree-sitter) - AST parsing
 
-- [Lip Gloss](https://github.com/charmbracelet/lipgloss) — Beautiful terminal styling
-- [go-tree-sitter](https://github.com/smacker/go-tree-sitter) — Tree-sitter bindings for Go
+## Contributing
 
-## 🤝 Contributing
+Ideas for contribution:
+- Add more languages (Go, Rust, Java, C++)
+- Improve fuzzy matching heuristics
+- Add `--json` output for CI integration
+- Syntax highlighting in conflict views
 
-Contributions are super welcome! Here are some ideas if you're looking for ways to help:
+## License
 
-- 🦀 Add support for more languages (Go, Rust, Java, C++, etc.)
-- 📊 Add `--json` output flag for CI/CD integration
-- 🎨 Syntax highlighting in conflict details
-- 🔧 Improve collision detection for deeply nested code structures
-- 📖 More documentation and examples
-
-## 📄 License
-
-MIT — do whatever you want with it!
-
----
-
-Made with ☕ and frustration from too many confusing merge conflicts.
+MIT

@@ -15,6 +15,7 @@ import (
 	"github.com/simonkoeck/g2/pkg/logging"
 	"github.com/simonkoeck/g2/pkg/output"
 	"github.com/simonkoeck/g2/pkg/semantic"
+	"github.com/simonkoeck/g2/pkg/tui"
 	"github.com/simonkoeck/g2/pkg/ui"
 )
 
@@ -725,6 +726,14 @@ func resolveConflictsWithJSON(ctx context.Context, config semantic.MergeConfig, 
 	if !config.JSONOutput {
 		ui.Summary(needsResolution, len(allConflicts))
 		fmt.Println()
+	}
+
+	// If running in a terminal and there are unresolved conflicts, launch TUI BEFORE synthesis
+	if !config.JSONOutput && !config.DryRun && tui.IsTerminal() && needsResolution > 0 {
+		return launchConflictTUI(ctx, config, conflictingFiles, synthesesByFile, jsonResult, opType)
+	}
+
+	if !config.JSONOutput {
 		if config.DryRun {
 			ui.Step("Dry run - showing proposed changes...")
 		} else {
@@ -877,4 +886,225 @@ func SmartCherryPickWithExecutor(args []string, exec git.Executor) int {
 		semantic.SetGitExecutor(oldExec)
 	}()
 	return smartCherryPick(args)
+}
+
+// launchConflictTUI launches the interactive TUI for resolving conflicts
+func launchConflictTUI(ctx context.Context, config semantic.MergeConfig, conflictingFiles []string, synthesesByFile map[string]*semantic.SynthesisAnalysis, jsonResult *output.MergeResult, opType OperationType) int {
+	// Build a map from (file, name) -> index in synthesis.Conflicts for applying resolutions
+	type conflictKey struct {
+		file string
+		name string
+	}
+	conflictIndices := make(map[conflictKey]int)
+
+	// Collect conflicts that need resolution
+	var tuiConflicts []tui.ConflictItem
+
+	for _, file := range conflictingFiles {
+		if !semantic.IsSemanticFile(file) {
+			continue
+		}
+
+		synthesis, ok := synthesesByFile[file]
+		if !ok {
+			continue
+		}
+
+		for i, sc := range synthesis.Conflicts {
+			if sc.UIConflict.Status != "Needs Resolution" {
+				continue
+			}
+
+			// Get name and kind from whichever definition exists
+			var name, kind string
+			if sc.Local != nil {
+				name = sc.Local.Name
+				kind = sc.Local.Kind
+			} else if sc.Remote != nil {
+				name = sc.Remote.Name
+				kind = sc.Remote.Kind
+			} else if sc.Base != nil {
+				name = sc.Base.Name
+				kind = sc.Base.Kind
+			}
+
+			// Store index for later resolution mapping
+			conflictIndices[conflictKey{file: file, name: name}] = i
+
+			// Get content bodies
+			var baseBody, localBody, remoteBody string
+			if sc.Base != nil {
+				baseBody = sc.Base.Body
+			}
+			if sc.Local != nil {
+				localBody = sc.Local.Body
+			}
+			if sc.Remote != nil {
+				remoteBody = sc.Remote.Body
+			}
+
+			tuiConflicts = append(tuiConflicts, tui.ConflictItem{
+				File:          file,
+				Name:          name,
+				Kind:          kind,
+				ConflictType:  sc.UIConflict.ConflictType,
+				BaseContent:   baseBody,
+				LocalContent:  localBody,
+				RemoteContent: remoteBody,
+			})
+		}
+	}
+
+	if len(tuiConflicts) == 0 {
+		ui.Info("No conflicts to resolve interactively")
+		// Fall back to standard synthesis
+		return synthesizeAllFiles(ctx, config, conflictingFiles, synthesesByFile, jsonResult, opType)
+	}
+
+	ui.Info(fmt.Sprintf("\nLaunching interactive resolver for %d conflict(s)...\n", len(tuiConflicts)))
+
+	// Run the TUI
+	result, err := tui.RunResolver(tuiConflicts)
+	if err != nil {
+		ui.Error(fmt.Sprintf("TUI error: %v", err))
+		return exitcode.GitError
+	}
+
+	if result.Aborted {
+		ui.Warning("Resolution aborted")
+		ui.Info(fmt.Sprintf("Run 'g2 continue' to try again, or 'g2 abort' to cancel the %s", opType.String()))
+		return exitcode.ConflictsRemain
+	}
+
+	// Print summary
+	tui.PrintSummary(result)
+
+	// Apply user resolutions to the synthesis analysis
+	resolved := 0
+	manualEdits := 0
+	for _, c := range result.Conflicts {
+		if c.Resolution == tui.ResolutionNone {
+			continue
+		}
+
+		if c.Resolution == tui.ResolutionSkip {
+			manualEdits++
+		} else {
+			resolved++
+		}
+
+		// Find the synthesis conflict and apply resolution
+		key := conflictKey{file: c.File, name: c.Name}
+		idx, ok := conflictIndices[key]
+		if !ok {
+			continue
+		}
+
+		synthesis := synthesesByFile[c.File]
+		if synthesis == nil || idx >= len(synthesis.Conflicts) {
+			continue
+		}
+
+		// Map TUI resolution to semantic resolution
+		switch c.Resolution {
+		case tui.ResolutionLocal:
+			synthesis.Conflicts[idx].UserResolution = semantic.UserResolutionLocal
+		case tui.ResolutionRemote:
+			synthesis.Conflicts[idx].UserResolution = semantic.UserResolutionRemote
+		case tui.ResolutionBoth:
+			synthesis.Conflicts[idx].UserResolution = semantic.UserResolutionBoth
+		case tui.ResolutionBase:
+			synthesis.Conflicts[idx].UserResolution = semantic.UserResolutionBase
+		case tui.ResolutionSkip:
+			synthesis.Conflicts[idx].UserResolution = semantic.UserResolutionSkip
+		}
+	}
+
+	if resolved == 0 && manualEdits == 0 {
+		ui.Info(fmt.Sprintf("\nRun 'g2 continue' to resolve remaining conflicts, or 'g2 abort' to cancel"))
+		return exitcode.ConflictsRemain
+	}
+
+	// Now run synthesis with user resolutions applied
+	ui.Step("\nSynthesizing files with your resolutions...")
+	return synthesizeAllFilesWithManualCount(ctx, config, conflictingFiles, synthesesByFile, jsonResult, opType, manualEdits)
+}
+
+// synthesizeAllFiles runs synthesis on all conflicting files
+func synthesizeAllFiles(ctx context.Context, config semantic.MergeConfig, conflictingFiles []string, synthesesByFile map[string]*semantic.SynthesisAnalysis, jsonResult *output.MergeResult, opType OperationType) int {
+	return synthesizeAllFilesWithManualCount(ctx, config, conflictingFiles, synthesesByFile, jsonResult, opType, 0)
+}
+
+// synthesizeAllFilesWithManualCount runs synthesis with tracking of manually-edited conflicts
+func synthesizeAllFilesWithManualCount(ctx context.Context, config semantic.MergeConfig, conflictingFiles []string, synthesesByFile map[string]*semantic.SynthesisAnalysis, jsonResult *output.MergeResult, opType OperationType, manualEdits int) int {
+	allAutoMerged := true
+	filesWithMarkers := 0
+
+	for _, file := range conflictingFiles {
+		if semantic.IsSemanticFile(file) {
+			synthesis := synthesesByFile[file]
+			result := semantic.SynthesizeFile(synthesis, config)
+
+			if config.JSONOutput && jsonResult != nil {
+				fileResult := output.FileResult{
+					File:          file,
+					ConflictCount: result.ConflictCount,
+					ResolvedCount: result.AutoMergeCount,
+					AllAutoMerged: result.AllAutoMerged,
+					HasMarkers:    !result.AllAutoMerged && result.Success,
+				}
+				if result.Error != nil {
+					fileResult.Error = result.Error.Error()
+				}
+				jsonResult.AddFileResult(fileResult)
+			}
+
+			if result.Error != nil {
+				logging.Warn("failed to synthesize file", "file", file, "error", result.Error)
+				ui.Warning(fmt.Sprintf("Failed to synthesize %s: %v", file, result.Error))
+				allAutoMerged = false
+			} else if !result.AllAutoMerged {
+				allAutoMerged = false
+				filesWithMarkers++
+			}
+		} else {
+			allAutoMerged = false
+			if config.JSONOutput && jsonResult != nil {
+				jsonResult.AddFileResult(output.FileResult{
+					File:          file,
+					ConflictCount: 1,
+					HasMarkers:    true,
+				})
+			}
+		}
+	}
+
+	fmt.Println()
+
+	if allAutoMerged {
+		if config.JSONOutput && jsonResult != nil {
+			jsonResult.Finalize()
+			output.WriteJSONStdout(jsonResult)
+		}
+		ui.Success("All conflicts resolved and staged!")
+		if opType != OpMerge {
+			ui.Info(fmt.Sprintf("Run 'g2 continue' to finish the %s", opType.String()))
+		}
+		return exitcode.Success
+	}
+
+	// If user marked some for manual editing, provide helpful message
+	if manualEdits > 0 {
+		ui.Info(fmt.Sprintf("%d conflict(s) left for manual editing", manualEdits))
+		ui.Info("Edit the files to resolve conflict markers, then run 'g2 continue'")
+	} else if filesWithMarkers > 0 {
+		ui.Info(fmt.Sprintf("%d file(s) have conflict markers - resolve manually", filesWithMarkers))
+		ui.Info(fmt.Sprintf("Run 'g2 continue' to continue after resolving, or 'g2 abort' to cancel"))
+	}
+
+	if config.JSONOutput && jsonResult != nil {
+		jsonResult.Finalize()
+		output.WriteJSONStdout(jsonResult)
+	}
+	return exitcode.ConflictsRemain
 }

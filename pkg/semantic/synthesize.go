@@ -15,12 +15,25 @@ import (
 	"github.com/simonkoeck/g2/pkg/ui"
 )
 
+// UserResolution represents a user's choice for resolving a conflict
+type UserResolution int
+
+const (
+	UserResolutionNone   UserResolution = iota // No user resolution (default)
+	UserResolutionLocal                        // Keep local version
+	UserResolutionRemote                       // Keep remote version
+	UserResolutionBoth                         // Keep both versions
+	UserResolutionBase                         // Keep base version
+	UserResolutionSkip                         // Leave conflict markers for manual editing
+)
+
 // SynthesisConflict carries full definition data for synthesis
 type SynthesisConflict struct {
-	UIConflict ui.Conflict
-	Local      *Definition // nil if deleted locally
-	Remote     *Definition // nil if deleted remotely
-	Base       *Definition // nil if added in both
+	UIConflict     ui.Conflict
+	Local          *Definition    // nil if deleted locally
+	Remote         *Definition    // nil if deleted remotely
+	Base           *Definition    // nil if added in both
+	UserResolution UserResolution // User's resolution choice (if any)
 }
 
 // SynthesisAnalysis contains all data needed to synthesize a file
@@ -419,6 +432,14 @@ func SynthesizeFile(analysis *SynthesisAnalysis, config MergeConfig) *SynthesisR
 		if conflict.UIConflict.Status == "Can Auto-merge" {
 			result.AutoMergeCount++
 			canvas = applyAutoMerge(canvas, &conflict)
+		} else if conflict.UserResolution == UserResolutionSkip {
+			// User chose to edit manually - insert conflict markers
+			allAutoMerged = false
+			canvas = insertConflictMarkers(canvas, &conflict)
+		} else if conflict.UserResolution != UserResolutionNone {
+			// User has resolved this conflict via TUI
+			result.AutoMergeCount++
+			canvas = applyUserResolution(canvas, &conflict)
 		} else {
 			allAutoMerged = false
 			canvas = insertConflictMarkers(canvas, &conflict)
@@ -523,6 +544,60 @@ func applyAutoMerge(canvas []byte, conflict *SynthesisConflict) []byte {
 	}
 
 	return canvas
+}
+
+// applyUserResolution applies a user's resolution choice
+func applyUserResolution(canvas []byte, conflict *SynthesisConflict) []byte {
+	var replacement string
+
+	switch conflict.UserResolution {
+	case UserResolutionLocal:
+		if conflict.Local != nil {
+			replacement = conflict.Local.Body
+		}
+	case UserResolutionRemote:
+		if conflict.Remote != nil {
+			replacement = conflict.Remote.Body
+		}
+	case UserResolutionBoth:
+		if conflict.Local != nil {
+			replacement = conflict.Local.Body
+		}
+		if conflict.Remote != nil {
+			if replacement != "" {
+				replacement += "\n\n"
+			}
+			replacement += conflict.Remote.Body
+		}
+	case UserResolutionBase:
+		if conflict.Base != nil {
+			replacement = conflict.Base.Body
+		}
+	default:
+		return canvas
+	}
+
+	// Determine position to replace
+	var startByte, endByte uint32
+	if conflict.Local != nil {
+		startByte = conflict.Local.StartByte
+		endByte = conflict.Local.EndByte
+	} else if conflict.Base != nil {
+		// Deleted locally - use base position
+		startByte = conflict.Base.StartByte
+		endByte = conflict.Base.StartByte // Insert without replacing
+	} else {
+		// Remote-only addition - append at end
+		if len(canvas) > 0 && canvas[len(canvas)-1] != '\n' {
+			replacement = "\n" + replacement
+		}
+		if len(canvas) > 0 {
+			replacement = "\n" + replacement
+		}
+		return append(canvas, []byte(replacement)...)
+	}
+
+	return replaceBytes(canvas, startByte, endByte, []byte(replacement))
 }
 
 // insertConflictMarkers inserts Git-style conflict markers
