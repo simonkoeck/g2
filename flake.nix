@@ -19,8 +19,8 @@
 
             src = ./.;
 
-            # Hash for Go module dependencies
-            vendorHash = "sha256-xcrVZigGUJJYz0JDMEYagoaDDG4l1GwBbtbvOE01oY4=";
+            # Hash for Go module dependencies (set to "" to get correct hash on first build)
+            vendorHash = "";
 
             meta = with pkgs.lib; {
               description = "Smart Git merge with semantic conflict resolution";
