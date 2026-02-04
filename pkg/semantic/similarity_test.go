@@ -136,3 +136,150 @@ func BenchmarkCalculateJaccard(b *testing.B) {
 		calculateJaccard(tokens1, tokens2)
 	}
 }
+
+// TestStripPythonComments tests Python comment stripping
+func TestStripPythonComments(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "single line comment",
+			input:    "x = 1  # this is a comment",
+			expected: "x = 1  ",
+		},
+		{
+			name:     "full line comment",
+			input:    "# comment\nx = 1",
+			expected: "\nx = 1",
+		},
+		{
+			name:     "multiple comments",
+			input:    "x = 1  # first\ny = 2  # second",
+			expected: "x = 1  \ny = 2  ",
+		},
+		{
+			name:     "no comments",
+			input:    "x = 1\ny = 2",
+			expected: "x = 1\ny = 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripPythonComments(tt.input)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestStripCStyleComments tests C-style comment stripping
+func TestStripCStyleComments(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "single line comment",
+			input:    "int x = 1; // comment",
+			expected: "int x = 1; ",
+		},
+		{
+			name:     "multi-line comment",
+			input:    "int x /* comment */ = 1;",
+			expected: "int x  = 1;",
+		},
+		{
+			name:     "multi-line block",
+			input:    "int x = 1;\n/* multi\nline\ncomment */\nint y = 2;",
+			expected: "int x = 1;\n\nint y = 2;",
+		},
+		{
+			name:     "mixed comments",
+			input:    "int x = 1; // inline\n/* block */ int y = 2;",
+			expected: "int x = 1; \n int y = 2;",
+		},
+		{
+			name:     "no comments",
+			input:    "int x = 1;\nint y = 2;",
+			expected: "int x = 1;\nint y = 2;",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripCStyleComments(tt.input)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestNormalizeForLanguage tests language-aware normalization
+func TestNormalizeForLanguage(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		lang     Language
+		expected string
+	}{
+		{
+			name:     "python with comment",
+			body:     "def foo():  # comment\n    return 1",
+			lang:     LangPython,
+			expected: "def foo(): return 1",
+		},
+		{
+			name:     "go with comment",
+			body:     "func foo() { // comment\n    return 1\n}",
+			lang:     LangGo,
+			expected: "func foo() { return 1 }",
+		},
+		{
+			name:     "js with semicolons",
+			body:     "function foo() { return 1; }",
+			lang:     LangJavaScript,
+			expected: "function foo() { return 1 }",
+		},
+		{
+			name:     "rust with comment",
+			body:     "fn foo() -> i32 { // returns 1\n    1\n}",
+			lang:     LangRust,
+			expected: "fn foo() -> i32 { 1 }",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := normalizeForLanguage(tt.body, tt.lang)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestStripCommentsPreservesCode tests that code is preserved after stripping
+func TestStripCommentsPreservesCode(t *testing.T) {
+	// Two functions that differ only by comments should normalize to the same thing
+	goCode1 := `func calculate(x int) int {
+    // Add one to x
+    return x + 1
+}`
+	goCode2 := `func calculate(x int) int {
+    /* Different comment style */
+    return x + 1
+}`
+
+	norm1 := normalizeForLanguage(goCode1, LangGo)
+	norm2 := normalizeForLanguage(goCode2, LangGo)
+
+	if norm1 != norm2 {
+		t.Errorf("code with different comments should normalize the same:\n  %q\n  %q", norm1, norm2)
+	}
+}

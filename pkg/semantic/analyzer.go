@@ -8,8 +8,10 @@ import (
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/javascript"
 	"github.com/smacker/go-tree-sitter/python"
+	"github.com/smacker/go-tree-sitter/rust"
 	"github.com/smacker/go-tree-sitter/typescript/typescript"
 	"github.com/smacker/go-tree-sitter/yaml"
 
@@ -38,6 +40,8 @@ const (
 	LangJavaScript
 	LangTypeScript
 	LangYAML
+	LangGo
+	LangRust
 )
 
 // Definition represents a code definition (function, class, or key)
@@ -120,6 +124,10 @@ func DetectLanguage(file string) Language {
 		return LangTypeScript
 	case ".json", ".yaml", ".yml":
 		return LangYAML
+	case ".go":
+		return LangGo
+	case ".rs":
+		return LangRust
 	default:
 		return LangUnknown
 	}
@@ -150,6 +158,10 @@ func ParseFile(content []byte, lang Language) *FileAnalysis {
 		return parseTypeScript(content)
 	case LangYAML:
 		return parseYAML(content)
+	case LangGo:
+		return parseGo(content)
+	case LangRust:
+		return parseRust(content)
 	default:
 		return &FileAnalysis{ParseError: fmt.Errorf("unsupported language")}
 	}
@@ -548,6 +560,429 @@ func extractYAMLKeys(node *sitter.Node, content []byte, defs *[]Definition) {
 	}
 }
 
+// parseGo parses Go content
+func parseGo(content []byte) *FileAnalysis {
+	parser := sitter.NewParser()
+	parser.SetLanguage(golang.GetLanguage())
+
+	tree, err := parser.ParseCtx(context.Background(), nil, content)
+	if err != nil {
+		return &FileAnalysis{ParseError: err}
+	}
+
+	analysis := &FileAnalysis{}
+	rootNode := tree.RootNode()
+
+	for i := 0; i < int(rootNode.NamedChildCount()); i++ {
+		child := rootNode.NamedChild(i)
+		extractGoDefinitions(child, content, &analysis.Definitions)
+	}
+
+	return analysis
+}
+
+// extractGoDefinitions extracts Go function, method, and type definitions
+func extractGoDefinitions(node *sitter.Node, content []byte, defs *[]Definition) {
+	if node == nil {
+		return
+	}
+
+	switch node.Type() {
+	case "function_declaration":
+		if def := extractGoFunction(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "method_declaration":
+		if def := extractGoMethod(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "type_declaration":
+		// Type declarations contain type_spec children
+		for i := 0; i < int(node.NamedChildCount()); i++ {
+			child := node.NamedChild(i)
+			if child.Type() == "type_spec" {
+				if def := extractGoTypeSpec(child, content); def != nil {
+					*defs = append(*defs, *def)
+				}
+			}
+		}
+	case "const_declaration", "var_declaration":
+		extractGoVarOrConst(node, content, defs)
+	}
+}
+
+func extractGoFunction(node *sitter.Node, content []byte) *Definition {
+	var name, params string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "identifier":
+			name = child.Content(content)
+		case "parameter_list":
+			params = child.Content(content)
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "function",
+		Signature: fmt.Sprintf("func %s%s", name, params),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractGoMethod(node *sitter.Node, content []byte) *Definition {
+	var name, receiver, params string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "field_identifier":
+			name = child.Content(content)
+		case "parameter_list":
+			if receiver == "" {
+				receiver = child.Content(content)
+			} else {
+				params = child.Content(content)
+			}
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "method",
+		Signature: fmt.Sprintf("func %s %s%s", receiver, name, params),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractGoTypeSpec(node *sitter.Node, content []byte) *Definition {
+	var name, kind string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "type_identifier":
+			name = child.Content(content)
+		case "struct_type":
+			kind = "struct"
+		case "interface_type":
+			kind = "interface"
+		default:
+			if kind == "" {
+				kind = "type"
+			}
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	if kind == "" {
+		kind = "type"
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      kind,
+		Signature: fmt.Sprintf("type %s", name),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractGoVarOrConst(node *sitter.Node, content []byte, defs *[]Definition) {
+	kind := "variable"
+	if node.Type() == "const_declaration" {
+		kind = "const"
+	}
+
+	// Handle both single and grouped declarations
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "const_spec" || child.Type() == "var_spec" {
+			// Extract identifier(s) from the spec
+			for j := 0; j < int(child.NamedChildCount()); j++ {
+				specChild := child.NamedChild(j)
+				if specChild.Type() == "identifier" {
+					name := specChild.Content(content)
+					if name != "" {
+						*defs = append(*defs, Definition{
+							Name:      name,
+							Kind:      kind,
+							Signature: fmt.Sprintf("%s %s", kind, name),
+							Body:      child.Content(content),
+							StartLine: child.StartPoint().Row,
+							EndLine:   child.EndPoint().Row,
+							StartByte: child.StartByte(),
+							EndByte:   child.EndByte(),
+						})
+					}
+					break // Only first identifier per spec
+				}
+			}
+		}
+	}
+}
+
+// parseRust parses Rust content
+func parseRust(content []byte) *FileAnalysis {
+	parser := sitter.NewParser()
+	parser.SetLanguage(rust.GetLanguage())
+
+	tree, err := parser.ParseCtx(context.Background(), nil, content)
+	if err != nil {
+		return &FileAnalysis{ParseError: err}
+	}
+
+	analysis := &FileAnalysis{}
+	rootNode := tree.RootNode()
+
+	for i := 0; i < int(rootNode.NamedChildCount()); i++ {
+		child := rootNode.NamedChild(i)
+		extractRustDefinitions(child, content, &analysis.Definitions)
+	}
+
+	return analysis
+}
+
+// extractRustDefinitions extracts Rust fn, impl, struct, enum, and trait definitions
+func extractRustDefinitions(node *sitter.Node, content []byte, defs *[]Definition) {
+	if node == nil {
+		return
+	}
+
+	switch node.Type() {
+	case "function_item":
+		if def := extractRustFunction(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "impl_item":
+		if def := extractRustImpl(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "struct_item":
+		if def := extractRustStruct(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "enum_item":
+		if def := extractRustEnum(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "trait_item":
+		if def := extractRustTrait(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "type_item":
+		if def := extractRustTypeAlias(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	case "const_item", "static_item":
+		if def := extractRustConstOrStatic(node, content); def != nil {
+			*defs = append(*defs, *def)
+		}
+	}
+}
+
+func extractRustFunction(node *sitter.Node, content []byte) *Definition {
+	var name, params string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "identifier":
+			name = child.Content(content)
+		case "parameters":
+			params = child.Content(content)
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "function",
+		Signature: fmt.Sprintf("fn %s%s", name, params),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractRustImpl(node *sitter.Node, content []byte) *Definition {
+	var typeName, traitName string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "type_identifier", "generic_type":
+			if typeName == "" {
+				typeName = child.Content(content)
+			}
+		case "trait_bounds":
+			traitName = child.Content(content)
+		}
+	}
+
+	if typeName == "" {
+		return nil
+	}
+
+	name := typeName
+	sig := fmt.Sprintf("impl %s", typeName)
+	if traitName != "" {
+		name = fmt.Sprintf("%s for %s", traitName, typeName)
+		sig = fmt.Sprintf("impl %s for %s", traitName, typeName)
+	}
+
+	return &Definition{
+		Name:      name,
+		Kind:      "impl",
+		Signature: sig,
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractRustStruct(node *sitter.Node, content []byte) *Definition {
+	var name string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" {
+			name = child.Content(content)
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "struct",
+		Signature: fmt.Sprintf("struct %s", name),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractRustEnum(node *sitter.Node, content []byte) *Definition {
+	var name string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" {
+			name = child.Content(content)
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "enum",
+		Signature: fmt.Sprintf("enum %s", name),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractRustTrait(node *sitter.Node, content []byte) *Definition {
+	var name string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" {
+			name = child.Content(content)
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "trait",
+		Signature: fmt.Sprintf("trait %s", name),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractRustTypeAlias(node *sitter.Node, content []byte) *Definition {
+	var name string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "type_identifier" {
+			name = child.Content(content)
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      "type",
+		Signature: fmt.Sprintf("type %s", name),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+func extractRustConstOrStatic(node *sitter.Node, content []byte) *Definition {
+	kind := "const"
+	if node.Type() == "static_item" {
+		kind = "static"
+	}
+
+	var name string
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		if child.Type() == "identifier" {
+			name = child.Content(content)
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	return &Definition{
+		Name:      name,
+		Kind:      kind,
+		Signature: fmt.Sprintf("%s %s", kind, name),
+		Body:      node.Content(content),
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
 // AnalyzeConflict analyzes a conflicting file and returns semantic conflict info
 func AnalyzeConflict(file string) *ConflictAnalysis {
 	result := &ConflictAnalysis{File: file}
@@ -656,12 +1091,6 @@ func mapDefinitions(defs []Definition) map[string]*Definition {
 		m[defs[i].Name] = &defs[i]
 	}
 	return m
-}
-
-// normalize collapses all whitespace to single spaces for semantic comparison
-// This allows detecting when two changes are semantically identical but differ in formatting
-func normalize(s string) string {
-	return strings.Join(strings.Fields(s), " ")
 }
 
 // analyzeDefinitionChange determines what kind of conflict exists for a definition

@@ -12,16 +12,37 @@ type MoveDetectionConfig struct {
 	FuzzyThreshold   float64 // Minimum Jaccard similarity for fuzzy match (default: 0.75)
 	EnableExactMatch bool    // Enable exact body matching (default: true)
 	EnableFuzzyMatch bool    // Enable fuzzy body matching (default: true)
+
+	// Tiered thresholds based on function size
+	SmallBodyTokens    int     // Bodies below this use stricter threshold (default: 20)
+	SmallBodyThreshold float64 // Stricter threshold for small bodies (default: 0.85)
+	LargeBodyTokens    int     // Bodies above this use lenient threshold (default: 100)
+	LargeBodyThreshold float64 // Lenient threshold for large bodies (default: 0.65)
 }
 
 // DefaultMoveDetectionConfig returns default configuration
 func DefaultMoveDetectionConfig() MoveDetectionConfig {
 	return MoveDetectionConfig{
-		MinTokenCount:    10,
-		FuzzyThreshold:   0.75,
-		EnableExactMatch: true,
-		EnableFuzzyMatch: true,
+		MinTokenCount:      10,
+		FuzzyThreshold:     0.75,
+		EnableExactMatch:   true,
+		EnableFuzzyMatch:   true,
+		SmallBodyTokens:    20,
+		SmallBodyThreshold: 0.85,
+		LargeBodyTokens:    100,
+		LargeBodyThreshold: 0.65,
 	}
+}
+
+// getThresholdForSize returns the appropriate threshold based on token count
+func getThresholdForSize(tokenCount int, config MoveDetectionConfig) float64 {
+	if tokenCount < config.SmallBodyTokens {
+		return config.SmallBodyThreshold
+	}
+	if tokenCount > config.LargeBodyTokens {
+		return config.LargeBodyThreshold
+	}
+	return config.FuzzyThreshold
 }
 
 // DetectMoves identifies move operations among conflicts and consolidates them
@@ -161,6 +182,9 @@ func findBestFuzzyMatch(del *SynthesisConflict, adds []*SynthesisConflict, delTo
 	bestIdx := -1
 	bestSimilarity := 0.0
 
+	// Get size-appropriate threshold for the delete body
+	delThreshold := getThresholdForSize(len(delTokens), config)
+
 	for addIdx, add := range adds {
 		if matchedAdds[addIdx] {
 			continue
@@ -179,8 +203,15 @@ func findBestFuzzyMatch(del *SynthesisConflict, adds []*SynthesisConflict, delTo
 			continue
 		}
 
+		// Use the more restrictive threshold of the two bodies
+		addThreshold := getThresholdForSize(len(addTokens), config)
+		threshold := delThreshold
+		if addThreshold > threshold {
+			threshold = addThreshold
+		}
+
 		similarity := calculateJaccard(delTokens, addTokens)
-		if similarity >= config.FuzzyThreshold && similarity > bestSimilarity {
+		if similarity >= threshold && similarity > bestSimilarity {
 			bestIdx = addIdx
 			bestSimilarity = similarity
 		}

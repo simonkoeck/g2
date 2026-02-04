@@ -602,6 +602,9 @@ func TestDetectMovesWithConfig_CustomThreshold(t *testing.T) {
 	t.Run("low threshold - matches", func(t *testing.T) {
 		config := DefaultMoveDetectionConfig()
 		config.FuzzyThreshold = 0.4
+		// Also set tiered thresholds low so small bodies use low threshold
+		config.SmallBodyThreshold = 0.4
+		config.LargeBodyThreshold = 0.4
 
 		result := DetectMovesWithConfig(conflicts, config)
 
@@ -613,11 +616,49 @@ func TestDetectMovesWithConfig_CustomThreshold(t *testing.T) {
 	t.Run("high threshold - no match", func(t *testing.T) {
 		config := DefaultMoveDetectionConfig()
 		config.FuzzyThreshold = 0.9
+		// Also set tiered thresholds high
+		config.SmallBodyThreshold = 0.9
+		config.LargeBodyThreshold = 0.9
 
 		result := DetectMovesWithConfig(conflicts, config)
 
 		if len(result) != 2 {
 			t.Errorf("expected 2 conflicts with high threshold, got %d", len(result))
+		}
+	})
+}
+
+// TestTieredThresholds tests that different body sizes use appropriate thresholds
+func TestTieredThresholds(t *testing.T) {
+	config := MoveDetectionConfig{
+		MinTokenCount:      5,
+		FuzzyThreshold:     0.75,
+		EnableExactMatch:   true,
+		EnableFuzzyMatch:   true,
+		SmallBodyTokens:    15,
+		SmallBodyThreshold: 0.90, // Strict for small
+		LargeBodyTokens:    50,
+		LargeBodyThreshold: 0.60, // Lenient for large
+	}
+
+	t.Run("small body uses strict threshold", func(t *testing.T) {
+		threshold := getThresholdForSize(10, config) // Below SmallBodyTokens
+		if threshold != 0.90 {
+			t.Errorf("expected 0.90 for small body, got %f", threshold)
+		}
+	})
+
+	t.Run("medium body uses default threshold", func(t *testing.T) {
+		threshold := getThresholdForSize(30, config) // Between small and large
+		if threshold != 0.75 {
+			t.Errorf("expected 0.75 for medium body, got %f", threshold)
+		}
+	})
+
+	t.Run("large body uses lenient threshold", func(t *testing.T) {
+		threshold := getThresholdForSize(60, config) // Above LargeBodyTokens
+		if threshold != 0.60 {
+			t.Errorf("expected 0.60 for large body, got %f", threshold)
 		}
 	})
 }

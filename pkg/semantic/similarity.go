@@ -3,6 +3,7 @@ package semantic
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -79,4 +80,60 @@ func calculateJaccard(tokens1, tokens2 []string) float64 {
 	}
 
 	return float64(intersection) / float64(union)
+}
+
+// Regex patterns for comment stripping
+var (
+	// C-style single line comments: // ...
+	cStyleSingleLineRe = regexp.MustCompile(`//[^\n]*`)
+	// C-style multi-line comments: /* ... */
+	cStyleMultiLineRe = regexp.MustCompile(`/\*[\s\S]*?\*/`)
+	// Python single line comments: # ...
+	pythonCommentRe = regexp.MustCompile(`#[^\n]*`)
+)
+
+// stripComments removes comments from code based on language
+func stripComments(body string, lang Language) string {
+	switch lang {
+	case LangPython:
+		return stripPythonComments(body)
+	case LangGo, LangRust, LangJavaScript, LangTypeScript:
+		return stripCStyleComments(body)
+	default:
+		return body
+	}
+}
+
+// stripPythonComments removes Python # comments
+// Note: This is a simple implementation that doesn't handle # inside strings
+func stripPythonComments(body string) string {
+	return pythonCommentRe.ReplaceAllString(body, "")
+}
+
+// stripCStyleComments removes // and /* */ comments
+// Note: This is a simple implementation that doesn't handle comments inside strings
+func stripCStyleComments(body string) string {
+	// First remove multi-line comments
+	result := cStyleMultiLineRe.ReplaceAllString(body, "")
+	// Then remove single-line comments
+	result = cStyleSingleLineRe.ReplaceAllString(result, "")
+	return result
+}
+
+// normalizeForLanguage provides enhanced normalization for semantic comparison
+// It strips comments and normalizes whitespace for language-aware comparison
+func normalizeForLanguage(body string, lang Language) string {
+	// Strip comments first
+	stripped := stripComments(body, lang)
+	// Normalize whitespace
+	normalized := normalize(stripped)
+	// Remove optional semicolons (helps with JS/TS)
+	normalized = strings.ReplaceAll(normalized, ";", "")
+	return normalized
+}
+
+// normalize collapses all whitespace to single spaces for semantic comparison
+// This is the basic normalizer - use normalizeForLanguage for enhanced comparison
+func normalize(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
