@@ -179,6 +179,9 @@ func smartMerge(args []string) {
 	// Final status
 	fmt.Println()
 	if config.DryRun {
+		// Abort the merge to restore repo state
+		abortCmd := exec.Command("git", "merge", "--abort")
+		abortCmd.Run() // Ignore errors - may not be in merge state
 		ui.Info("Dry run complete - no files were modified")
 		os.Exit(0)
 	} else if allAutoMerged && needsResolution == 0 {
