@@ -196,13 +196,12 @@ func extractPythonDefinitions(node *sitter.Node, content []byte, defs *[]Definit
 
 	switch node.Type() {
 	case "function_definition":
-		if def := extractPythonFunction(node, content); def != nil {
+		if def := extractPythonFunction(node, content, ""); def != nil {
 			*defs = append(*defs, *def)
 		}
 	case "class_definition":
-		if def := extractPythonClass(node, content); def != nil {
-			*defs = append(*defs, *def)
-		}
+		classDefs := extractPythonClassWithMethods(node, content)
+		*defs = append(*defs, classDefs...)
 	case "decorated_definition":
 		for i := 0; i < int(node.NamedChildCount()); i++ {
 			child := node.NamedChild(i)
@@ -213,7 +212,7 @@ func extractPythonDefinitions(node *sitter.Node, content []byte, defs *[]Definit
 	}
 }
 
-func extractPythonFunction(node *sitter.Node, content []byte) *Definition {
+func extractPythonFunction(node *sitter.Node, content []byte, classPrefix string) *Definition {
 	var name, params, body string
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
@@ -234,9 +233,17 @@ func extractPythonFunction(node *sitter.Node, content []byte) *Definition {
 	if body == "" {
 		body = node.Content(content)
 	}
+
+	fullName := name
+	kind := "function"
+	if classPrefix != "" {
+		fullName = classPrefix + "." + name
+		kind = "method"
+	}
+
 	return &Definition{
-		Name:      name,
-		Kind:      "function",
+		Name:      fullName,
+		Kind:      kind,
 		Signature: fmt.Sprintf("def %s%s", name, params),
 		Body:      body,
 		StartLine: node.StartPoint().Row,
@@ -246,28 +253,50 @@ func extractPythonFunction(node *sitter.Node, content []byte) *Definition {
 	}
 }
 
-func extractPythonClass(node *sitter.Node, content []byte) *Definition {
-	var name string
+// extractPythonClassWithMethods extracts a class and all its methods as separate definitions
+func extractPythonClassWithMethods(node *sitter.Node, content []byte) []Definition {
+	var defs []Definition
+	var className string
+	var classBody *sitter.Node
+
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
-		if child.Type() == "identifier" {
-			name = child.Content(content)
-			break
+		switch child.Type() {
+		case "identifier":
+			className = child.Content(content)
+		case "block":
+			classBody = child
 		}
 	}
-	if name == "" {
-		return nil
+
+	if className == "" {
+		return defs
 	}
-	return &Definition{
-		Name:      name,
-		Kind:      "class",
-		Signature: fmt.Sprintf("class %s", name),
-		Body:      node.Content(content),
-		StartLine: node.StartPoint().Row,
-		EndLine:   node.EndPoint().Row,
-		StartByte: node.StartByte(),
-		EndByte:   node.EndByte(),
+
+	// Extract methods from the class body
+	if classBody != nil {
+		for i := 0; i < int(classBody.NamedChildCount()); i++ {
+			child := classBody.NamedChild(i)
+			switch child.Type() {
+			case "function_definition":
+				if def := extractPythonFunction(child, content, className); def != nil {
+					defs = append(defs, *def)
+				}
+			case "decorated_definition":
+				// Handle decorated methods (@staticmethod, @classmethod, @property, etc.)
+				for j := 0; j < int(child.NamedChildCount()); j++ {
+					grandchild := child.NamedChild(j)
+					if grandchild.Type() == "function_definition" {
+						if def := extractPythonFunction(grandchild, content, className); def != nil {
+							defs = append(defs, *def)
+						}
+					}
+				}
+			}
+		}
 	}
+
+	return defs
 }
 
 // parseJavaScript parses JavaScript content
@@ -327,9 +356,8 @@ func extractJSDefinitions(node *sitter.Node, content []byte, defs *[]Definition)
 		}
 
 	case "class_declaration":
-		if def := extractJSClass(node, content); def != nil {
-			*defs = append(*defs, *def)
-		}
+		classDefs := extractJSClassWithMethods(node, content)
+		*defs = append(*defs, classDefs...)
 
 	case "lexical_declaration", "variable_declaration":
 		// Handle const/let/var declarations (including arrow functions)
@@ -394,23 +422,161 @@ func extractJSFunction(node *sitter.Node, content []byte) *Definition {
 	}
 }
 
-func extractJSClass(node *sitter.Node, content []byte) *Definition {
-	var name string
+// extractJSClassWithMethods extracts a class and all its methods as separate definitions
+func extractJSClassWithMethods(node *sitter.Node, content []byte) []Definition {
+	var defs []Definition
+	var className string
+	var classBody *sitter.Node
+
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
-		if child.Type() == "identifier" || child.Type() == "type_identifier" {
-			name = child.Content(content)
-			break
+		switch child.Type() {
+		case "identifier", "type_identifier":
+			className = child.Content(content)
+		case "class_body":
+			classBody = child
 		}
 	}
+
+	if className == "" {
+		return defs
+	}
+
+	// Extract methods from the class body
+	if classBody != nil {
+		for i := 0; i < int(classBody.NamedChildCount()); i++ {
+			child := classBody.NamedChild(i)
+			switch child.Type() {
+			case "method_definition":
+				if def := extractJSMethod(child, content, className); def != nil {
+					defs = append(defs, *def)
+				}
+			case "public_field_definition", "field_definition":
+				// Handle class fields that might be arrow functions
+				if def := extractJSClassField(child, content, className); def != nil {
+					defs = append(defs, *def)
+				}
+			}
+		}
+	}
+
+	return defs
+}
+
+// extractJSMethod extracts a method from a JS/TS class
+func extractJSMethod(node *sitter.Node, content []byte, className string) *Definition {
+	var name, params, body string
+	isStatic := false
+	isAsync := false
+	isGetter := false
+	isSetter := false
+
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "property_identifier":
+			name = child.Content(content)
+		case "formal_parameters":
+			params = child.Content(content)
+		case "statement_block":
+			body = child.Content(content)
+		}
+	}
+
+	// Check for modifiers in the raw content
+	nodeContent := node.Content(content)
+	if strings.Contains(nodeContent[:min(20, len(nodeContent))], "static") {
+		isStatic = true
+	}
+	if strings.Contains(nodeContent[:min(20, len(nodeContent))], "async") {
+		isAsync = true
+	}
+	if strings.Contains(nodeContent[:min(10, len(nodeContent))], "get ") {
+		isGetter = true
+	}
+	if strings.Contains(nodeContent[:min(10, len(nodeContent))], "set ") {
+		isSetter = true
+	}
+
 	if name == "" {
 		return nil
 	}
+	if body == "" {
+		body = node.Content(content)
+	}
+
+	fullName := className + "." + name
+	kind := "method"
+	if isGetter {
+		kind = "getter"
+	} else if isSetter {
+		kind = "setter"
+	}
+
+	// Build signature
+	sig := ""
+	if isStatic {
+		sig += "static "
+	}
+	if isAsync {
+		sig += "async "
+	}
+	if isGetter {
+		sig += "get "
+	} else if isSetter {
+		sig += "set "
+	}
+	sig += name + params
+
 	return &Definition{
-		Name:      name,
-		Kind:      "class",
-		Signature: fmt.Sprintf("class %s", name),
-		Body:      node.Content(content),
+		Name:      fullName,
+		Kind:      kind,
+		Signature: sig,
+		Body:      body,
+		StartLine: node.StartPoint().Row,
+		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
+	}
+}
+
+// extractJSClassField extracts a class field (which might be an arrow function)
+func extractJSClassField(node *sitter.Node, content []byte, className string) *Definition {
+	var name string
+	var value *sitter.Node
+
+	for i := 0; i < int(node.NamedChildCount()); i++ {
+		child := node.NamedChild(i)
+		switch child.Type() {
+		case "property_identifier":
+			name = child.Content(content)
+		case "arrow_function", "function":
+			value = child
+		}
+	}
+
+	if name == "" || value == nil {
+		return nil // Only extract fields that are functions
+	}
+
+	fullName := className + "." + name
+	var body string
+	for i := 0; i < int(value.NamedChildCount()); i++ {
+		child := value.NamedChild(i)
+		if child.Type() == "statement_block" {
+			body = child.Content(content)
+			break
+		}
+	}
+	if body == "" {
+		body = value.Content(content)
+	}
+
+	return &Definition{
+		Name:      fullName,
+		Kind:      "method",
+		Signature: name + " = () =>",
+		Body:      body,
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
 		StartByte: node.StartByte(),
