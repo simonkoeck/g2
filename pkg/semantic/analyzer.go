@@ -36,6 +36,8 @@ type Definition struct {
 	Body      string
 	StartLine uint32
 	EndLine   uint32
+	StartByte uint32
+	EndByte   uint32
 }
 
 // FileAnalysis contains parsed definitions from a file
@@ -193,6 +195,8 @@ func extractPythonFunction(node *sitter.Node, content []byte) *Definition {
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -215,6 +219,8 @@ func extractPythonClass(node *sitter.Node, content []byte) *Definition {
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -330,6 +336,8 @@ func extractJSFunction(node *sitter.Node, content []byte) *Definition {
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -352,6 +360,8 @@ func extractJSClass(node *sitter.Node, content []byte) *Definition {
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -401,6 +411,8 @@ func extractJSVariableDeclarator(node *sitter.Node, content []byte) *Definition 
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -423,6 +435,8 @@ func extractTSInterface(node *sitter.Node, content []byte) *Definition {
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -445,6 +459,8 @@ func extractTSTypeAlias(node *sitter.Node, content []byte) *Definition {
 		Body:      node.Content(content),
 		StartLine: node.StartPoint().Row,
 		EndLine:   node.EndPoint().Row,
+		StartByte: node.StartByte(),
+		EndByte:   node.EndByte(),
 	}
 }
 
@@ -489,6 +505,8 @@ func extractYAMLKeys(node *sitter.Node, content []byte, defs *[]Definition) {
 						Body:      node.Content(content),
 						StartLine: node.StartPoint().Row,
 						EndLine:   node.EndPoint().Row,
+						StartByte: node.StartByte(),
+						EndByte:   node.EndByte(),
 					})
 				}
 			}
@@ -686,10 +704,19 @@ func analyzeDefinitionChange(file, name string, base, local, remote *Definition)
 		remoteChanged := remoteNorm != baseNorm
 
 		if localChanged && remoteChanged {
-			if localNorm == remoteNorm {
+			// Check if bodies are exactly identical
+			if local.Body == remote.Body {
 				return &ui.Conflict{
 					File:         file,
 					ConflictType: fmt.Sprintf("%s '%s' Modified (same)", kindStr, name),
+					Status:       "Can Auto-merge",
+				}
+			}
+			// Check if semantically identical but different formatting
+			if localNorm == remoteNorm {
+				return &ui.Conflict{
+					File:         file,
+					ConflictType: fmt.Sprintf("%s '%s' Formatted Change", kindStr, name),
 					Status:       "Can Auto-merge",
 				}
 			}

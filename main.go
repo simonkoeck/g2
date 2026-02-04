@@ -126,8 +126,62 @@ func smartMerge(args []string) {
 
 	ui.Summary(needsResolution, len(allConflicts))
 
-	// Exit with error code to indicate conflicts
-	os.Exit(1)
+	// Parse merge config from args
+	config := semantic.DefaultMergeConfig()
+	for _, arg := range args {
+		if arg == "--dry-run" {
+			config.DryRun = true
+		}
+		if arg == "--verbose" || arg == "-v" {
+			config.Verbose = true
+		}
+		if arg == "--no-backup" {
+			config.CreateBackup = false
+		}
+	}
+
+	// Synthesize files
+	fmt.Println()
+	if config.DryRun {
+		ui.Step("Dry run - showing proposed changes...")
+	} else {
+		ui.Step("Synthesizing files...")
+	}
+	allAutoMerged := true
+	filesWithMarkers := 0
+
+	for _, file := range conflictingFiles {
+		if semantic.IsSemanticFile(file) {
+			synthesis := semantic.AnalyzeConflictForSynthesis(file)
+			result := semantic.SynthesizeFile(synthesis, config)
+
+			if result.Error != nil {
+				ui.Warning(fmt.Sprintf("Failed to synthesize %s: %v", file, result.Error))
+				allAutoMerged = false
+			} else if !result.AllAutoMerged {
+				allAutoMerged = false
+				filesWithMarkers++
+			}
+		} else {
+			allAutoMerged = false
+		}
+	}
+
+	// Final status
+	fmt.Println()
+	if config.DryRun {
+		ui.Info("Dry run complete - no files were modified")
+		os.Exit(0)
+	} else if allAutoMerged && needsResolution == 0 {
+		ui.Success("All conflicts auto-merged and staged!")
+		os.Exit(0)
+	} else {
+		if filesWithMarkers > 0 {
+			ui.Info(fmt.Sprintf("%d file(s) have conflict markers - resolve manually", filesWithMarkers))
+		}
+		// Exit with error code to indicate conflicts remain
+		os.Exit(1)
+	}
 }
 
 // isGitRepo checks if the current directory is inside a git repository
