@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -14,8 +13,21 @@ import (
 	"github.com/smacker/go-tree-sitter/typescript/typescript"
 	"github.com/smacker/go-tree-sitter/yaml"
 
+	"github.com/simonkoeck/g2/pkg/git"
 	"github.com/simonkoeck/g2/pkg/ui"
 )
+
+// Package-level git executor (can be replaced for testing)
+var gitExec git.Executor = git.NewDefaultExecutor()
+
+// SetGitExecutor sets the git executor (for testing).
+func SetGitExecutor(exec git.Executor) {
+	gitExec = exec
+}
+
+// MaxFileSize is the maximum file size to process (default 10MB).
+// Files larger than this will be skipped with an error.
+var MaxFileSize int64 = 10 * 1024 * 1024
 
 // Language represents a supported programming language
 type Language int
@@ -54,8 +66,12 @@ type ConflictAnalysis struct {
 
 // GetConflictingFiles returns list of files with merge conflicts
 func GetConflictingFiles() ([]string, error) {
-	cmd := exec.Command("git", "diff", "--name-only", "--diff-filter=U")
-	output, err := cmd.Output()
+	return GetConflictingFilesWithContext(context.Background())
+}
+
+// GetConflictingFilesWithContext returns list of files with merge conflicts using context.
+func GetConflictingFilesWithContext(ctx context.Context) ([]string, error) {
+	output, err := gitExec.Output(ctx, "diff", "--name-only", "--diff-filter=U")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get conflicting files: %w", err)
 	}
@@ -73,11 +89,22 @@ func GetConflictingFiles() ([]string, error) {
 // GetFileVersion retrieves a specific version of a file during merge
 // stage: 1=base (common ancestor), 2=local (ours), 3=remote (theirs)
 func GetFileVersion(file string, stage int) ([]byte, error) {
-	cmd := exec.Command("git", "show", fmt.Sprintf(":%d:%s", stage, file))
-	output, err := cmd.Output()
+	return GetFileVersionWithContext(context.Background(), file, stage)
+}
+
+// GetFileVersionWithContext retrieves a specific version of a file during merge using context.
+// stage: 1=base (common ancestor), 2=local (ours), 3=remote (theirs)
+func GetFileVersionWithContext(ctx context.Context, file string, stage int) ([]byte, error) {
+	output, err := gitExec.Output(ctx, "show", fmt.Sprintf(":%d:%s", stage, file))
 	if err != nil {
 		return nil, err
 	}
+
+	// Check file size limit
+	if MaxFileSize > 0 && int64(len(output)) > MaxFileSize {
+		return nil, fmt.Errorf("file too large: %d bytes (max %d)", len(output), MaxFileSize)
+	}
+
 	return output, nil
 }
 
@@ -680,8 +707,34 @@ func analyzeDefinitionChange(file, name string, base, local, remote *Definition)
 		}
 	}
 
+	// Case 1b: Added only in local (orphan add)
+	if base == nil && local != nil && remote == nil {
+		return &ui.Conflict{
+			File:         file,
+			ConflictType: fmt.Sprintf("%s '%s' Added (local)", kindStr, name),
+			Status:       "Needs Resolution",
+		}
+	}
+
+	// Case 1c: Added only in remote (orphan add)
+	if base == nil && local == nil && remote != nil {
+		return &ui.Conflict{
+			File:         file,
+			ConflictType: fmt.Sprintf("%s '%s' Added (remote)", kindStr, name),
+			Status:       "Needs Resolution",
+		}
+	}
+
 	// Case 2: Removed in one branch, modified in other
 	if base != nil {
+		// Deleted on both branches (orphan delete)
+		if local == nil && remote == nil {
+			return &ui.Conflict{
+				File:         file,
+				ConflictType: fmt.Sprintf("%s '%s' Deleted", kindStr, name),
+				Status:       "Needs Resolution",
+			}
+		}
 		if local == nil && remote != nil && remoteNorm != baseNorm {
 			return &ui.Conflict{
 				File:         file,

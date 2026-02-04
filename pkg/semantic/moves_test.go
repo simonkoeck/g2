@@ -647,3 +647,586 @@ func BenchmarkDetectMoves_LargeFile(b *testing.B) {
 		DetectMoves(conflicts)
 	}
 }
+
+// =============================================================================
+// Inter-File Move Detection Tests
+// =============================================================================
+
+// Helper to create a SynthesisAnalysis for testing
+func makeAnalysis(file string, conflicts []SynthesisConflict) *SynthesisAnalysis {
+	return &SynthesisAnalysis{
+		File:      file,
+		Conflicts: conflicts,
+	}
+}
+
+// Helper to create a delete conflict for a specific file
+func makeDeleteConflictForFile(file, name, body string) SynthesisConflict {
+	return SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         file,
+			ConflictType: "Function '" + name + "' Deleted",
+			Status:       "Needs Resolution",
+		},
+		Base: &Definition{
+			Name: name,
+			Kind: "function",
+			Body: body,
+		},
+		Local:  nil,
+		Remote: nil,
+	}
+}
+
+// Helper to create a local add conflict for a specific file
+func makeAddConflictForFile(file, name, body string) SynthesisConflict {
+	return SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         file,
+			ConflictType: "Function '" + name + "' Added (local)",
+			Status:       "Needs Resolution",
+		},
+		Base: nil,
+		Local: &Definition{
+			Name: name,
+			Kind: "function",
+			Body: body,
+		},
+		Remote: nil,
+	}
+}
+
+// Helper to create a remote add conflict for a specific file
+func makeRemoteAddConflictForFile(file, name, body string) SynthesisConflict {
+	return SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         file,
+			ConflictType: "Function '" + name + "' Added (remote)",
+			Status:       "Needs Resolution",
+		},
+		Base:  nil,
+		Local: nil,
+		Remote: &Definition{
+			Name: name,
+			Kind: "function",
+			Body: body,
+		},
+	}
+}
+
+// TestDetectInterFileMoves_ExactMatch tests exact body match across files
+func TestDetectInterFileMoves_ExactMatch(t *testing.T) {
+	body := "def helper():\n    return calculate_something()\n    with_multiple_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+		}),
+		makeAnalysis("newutils.py", []SynthesisConflict{
+			makeAddConflictForFile("newutils.py", "helper", body),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 1 {
+		t.Fatalf("expected 1 inter-file move, got %d", len(moves))
+	}
+
+	move := moves[0]
+	if move.SourceFile != "utils.py" {
+		t.Errorf("expected source file 'utils.py', got '%s'", move.SourceFile)
+	}
+	if move.DestFile != "newutils.py" {
+		t.Errorf("expected dest file 'newutils.py', got '%s'", move.DestFile)
+	}
+	if move.MatchType != "Exact Match" {
+		t.Errorf("expected 'Exact Match', got '%s'", move.MatchType)
+	}
+	if move.Similarity != 1.0 {
+		t.Errorf("expected similarity 1.0, got %f", move.Similarity)
+	}
+}
+
+// TestDetectInterFileMoves_FuzzyMatch tests fuzzy body match across files
+func TestDetectInterFileMoves_FuzzyMatch(t *testing.T) {
+	deleteBody := "def calculate_total(items):\n    total = 0\n    for item in items:\n        total += item.price\n    return total"
+	addBody := "def calculate_total(items):\n    total = 0\n    for item in items:\n        total += item.price\n    return total * 1.1" // added tax
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "calculate_total", deleteBody),
+		}),
+		makeAnalysis("pricing.py", []SynthesisConflict{
+			makeAddConflictForFile("pricing.py", "calculate_total", addBody),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 1 {
+		t.Fatalf("expected 1 inter-file move, got %d", len(moves))
+	}
+
+	move := moves[0]
+	if move.MatchType != "Fuzzy Match" {
+		t.Errorf("expected 'Fuzzy Match', got '%s'", move.MatchType)
+	}
+	if move.Similarity < 0.75 || move.Similarity >= 1.0 {
+		t.Errorf("expected similarity between 0.75 and 1.0, got %f", move.Similarity)
+	}
+}
+
+// TestDetectInterFileMoves_SameFileNotMatched tests that same-file orphans are not matched
+func TestDetectInterFileMoves_SameFileNotMatched(t *testing.T) {
+	body := "def helper():\n    return calculate_something()\n    with_multiple_lines()"
+
+	// Both delete and add in the same file - should NOT be matched by inter-file detection
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+			makeAddConflictForFile("utils.py", "helper", body),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 inter-file moves (same file), got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_KindMismatch tests that different kinds don't match across files
+func TestDetectInterFileMoves_KindMismatch(t *testing.T) {
+	body := "content that is the same\nwith multiple lines\nto ensure matching"
+
+	// Delete a function in one file
+	deleteConflict := SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "utils.py",
+			ConflictType: "Function 'foo' Deleted",
+			Status:       "Needs Resolution",
+		},
+		Base: &Definition{
+			Name: "foo",
+			Kind: "function",
+			Body: body,
+		},
+	}
+
+	// Add a class with same body in another file
+	addConflict := SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "models.py",
+			ConflictType: "Class 'foo' Added",
+			Status:       "Needs Resolution",
+		},
+		Local: &Definition{
+			Name: "foo",
+			Kind: "class", // different kind
+			Body: body,
+		},
+	}
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{deleteConflict}),
+		makeAnalysis("models.py", []SynthesisConflict{addConflict}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves (kind mismatch), got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_MultipleFiles tests moves across multiple files
+func TestDetectInterFileMoves_MultipleFiles(t *testing.T) {
+	body1 := "def helper1():\n    return first_implementation()\n    with_multiple_lines()"
+	body2 := "def helper2():\n    return second_implementation()\n    also_multiple_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("old_utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("old_utils.py", "helper1", body1),
+			makeDeleteConflictForFile("old_utils.py", "helper2", body2),
+		}),
+		makeAnalysis("new_utils1.py", []SynthesisConflict{
+			makeAddConflictForFile("new_utils1.py", "helper1", body1),
+		}),
+		makeAnalysis("new_utils2.py", []SynthesisConflict{
+			makeAddConflictForFile("new_utils2.py", "helper2", body2),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 2 {
+		t.Fatalf("expected 2 inter-file moves, got %d", len(moves))
+	}
+
+	// Verify both moves are detected
+	foundMove1 := false
+	foundMove2 := false
+	for _, move := range moves {
+		if move.SourceFile == "old_utils.py" && move.DestFile == "new_utils1.py" {
+			foundMove1 = true
+		}
+		if move.SourceFile == "old_utils.py" && move.DestFile == "new_utils2.py" {
+			foundMove2 = true
+		}
+	}
+
+	if !foundMove1 {
+		t.Error("expected move from old_utils.py to new_utils1.py")
+	}
+	if !foundMove2 {
+		t.Error("expected move from old_utils.py to new_utils2.py")
+	}
+}
+
+// TestDetectInterFileMoves_NoOrphans tests when there are no orphan conflicts
+func TestDetectInterFileMoves_NoOrphans(t *testing.T) {
+	// Regular modified conflict (has base, local, and remote) - not an orphan
+	modifiedConflict := SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "utils.py",
+			ConflictType: "Function 'foo' Modified",
+			Status:       "Needs Resolution",
+		},
+		Base:   &Definition{Name: "foo", Kind: "function", Body: "def foo(): pass"},
+		Local:  &Definition{Name: "foo", Kind: "function", Body: "def foo(): return 1"},
+		Remote: &Definition{Name: "foo", Kind: "function", Body: "def foo(): return 2"},
+	}
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{modifiedConflict}),
+		makeAnalysis("other.py", []SynthesisConflict{modifiedConflict}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves (no orphans), got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_EmptyAnalyses tests empty input
+func TestDetectInterFileMoves_EmptyAnalyses(t *testing.T) {
+	moves := DetectInterFileMoves([]*SynthesisAnalysis{})
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves for empty input, got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_SingleFile tests single file (no inter-file possible)
+func TestDetectInterFileMoves_SingleFile(t *testing.T) {
+	body := "def helper():\n    return something()\n    multiple_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves for single file, got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_OnlyDeletes tests when there are only deletes (no adds)
+func TestDetectInterFileMoves_OnlyDeletes(t *testing.T) {
+	body := "def helper():\n    return something()\n    multiple_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+		}),
+		makeAnalysis("other.py", []SynthesisConflict{
+			makeDeleteConflictForFile("other.py", "other_func", body),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves (only deletes), got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_OnlyAdds tests when there are only adds (no deletes)
+func TestDetectInterFileMoves_OnlyAdds(t *testing.T) {
+	body := "def helper():\n    return something()\n    multiple_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeAddConflictForFile("utils.py", "helper", body),
+		}),
+		makeAnalysis("other.py", []SynthesisConflict{
+			makeAddConflictForFile("other.py", "other_func", body),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves (only adds), got %d", len(moves))
+	}
+}
+
+// TestDetectInterFileMoves_RemoteAdd tests inter-file move with remote-side add
+func TestDetectInterFileMoves_RemoteAdd(t *testing.T) {
+	body := "def helper():\n    return calculate_something()\n    with_multiple_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+		}),
+		makeAnalysis("newutils.py", []SynthesisConflict{
+			makeRemoteAddConflictForFile("newutils.py", "helper", body),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 1 {
+		t.Fatalf("expected 1 inter-file move, got %d", len(moves))
+	}
+
+	move := moves[0]
+	if move.DestConflict.Remote == nil {
+		t.Error("expected dest conflict to have Remote set")
+	}
+}
+
+// TestDetectInterFileMoves_BoilerplateSafety tests that small bodies don't match
+func TestDetectInterFileMoves_BoilerplateSafety(t *testing.T) {
+	// Very small bodies that shouldn't be fuzzy matched
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("a.py", []SynthesisConflict{
+			makeDeleteConflictForFile("a.py", "x", "x = 1"),
+		}),
+		makeAnalysis("b.py", []SynthesisConflict{
+			makeAddConflictForFile("b.py", "y", "y = 2"),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	// Small bodies shouldn't match via fuzzy, and they're different so no exact match
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves (boilerplate safety), got %d", len(moves))
+	}
+}
+
+// TestApplyInterFileMoves_UpdatesConflicts tests that ApplyInterFileMoves updates conflicts correctly
+func TestApplyInterFileMoves_UpdatesConflicts(t *testing.T) {
+	body := "def helper():\n    return something()\n    multiple_lines()"
+
+	sourceConflict := makeDeleteConflictForFile("utils.py", "helper", body)
+	destConflict := makeAddConflictForFile("newutils.py", "helper", body)
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{sourceConflict}),
+		makeAnalysis("newutils.py", []SynthesisConflict{destConflict}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+	ApplyInterFileMoves(analyses, moves)
+
+	// Check source conflict was updated
+	srcConflict := &analyses[0].Conflicts[0]
+	if srcConflict.UIConflict.Status != "Can Auto-merge" {
+		t.Errorf("source conflict status should be 'Can Auto-merge', got '%s'", srcConflict.UIConflict.Status)
+	}
+	if !strings.Contains(srcConflict.UIConflict.ConflictType, "Moved to newutils.py") {
+		t.Errorf("source conflict type should mention dest file, got '%s'", srcConflict.UIConflict.ConflictType)
+	}
+	if !strings.Contains(srcConflict.UIConflict.ConflictType, "Exact Match") {
+		t.Errorf("source conflict type should mention match type, got '%s'", srcConflict.UIConflict.ConflictType)
+	}
+
+	// Check dest conflict was updated
+	dstConflict := &analyses[1].Conflicts[0]
+	if dstConflict.UIConflict.Status != "Can Auto-merge" {
+		t.Errorf("dest conflict status should be 'Can Auto-merge', got '%s'", dstConflict.UIConflict.Status)
+	}
+	if !strings.Contains(dstConflict.UIConflict.ConflictType, "Moved from utils.py") {
+		t.Errorf("dest conflict type should mention source file, got '%s'", dstConflict.UIConflict.ConflictType)
+	}
+}
+
+// TestApplyInterFileMoves_FuzzyMatchPercentage tests fuzzy match percentage in conflict type
+func TestApplyInterFileMoves_FuzzyMatchPercentage(t *testing.T) {
+	deleteBody := "def calculate_total(items):\n    total = 0\n    for item in items:\n        total += item.price\n    return total"
+	addBody := "def calculate_total(items):\n    total = 0\n    for item in items:\n        total += item.price\n    return total * 1.1"
+
+	sourceConflict := makeDeleteConflictForFile("utils.py", "calculate_total", deleteBody)
+	destConflict := makeAddConflictForFile("pricing.py", "calculate_total", addBody)
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{sourceConflict}),
+		makeAnalysis("pricing.py", []SynthesisConflict{destConflict}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+	ApplyInterFileMoves(analyses, moves)
+
+	// Check that percentage is shown for fuzzy match
+	srcConflict := &analyses[0].Conflicts[0]
+	if !strings.Contains(srcConflict.UIConflict.ConflictType, "% Match") {
+		t.Errorf("fuzzy match should show percentage, got '%s'", srcConflict.UIConflict.ConflictType)
+	}
+}
+
+// TestApplyInterFileMoves_EmptyMoves tests applying empty moves list
+func TestApplyInterFileMoves_EmptyMoves(t *testing.T) {
+	body := "def helper(): pass"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+		}),
+	}
+
+	originalStatus := analyses[0].Conflicts[0].UIConflict.Status
+
+	ApplyInterFileMoves(analyses, []InterFileMove{})
+
+	// Conflicts should be unchanged
+	if analyses[0].Conflicts[0].UIConflict.Status != originalStatus {
+		t.Error("conflict should be unchanged when no moves applied")
+	}
+}
+
+// TestDetectInterFileMoves_MixedConflictTypes tests with mix of orphans and non-orphans
+func TestDetectInterFileMoves_MixedConflictTypes(t *testing.T) {
+	moveBody := "def helper():\n    return calculate_something()\n    with_multiple_lines()"
+
+	// Modified conflict (not an orphan)
+	modifiedConflict := SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "utils.py",
+			ConflictType: "Function 'other' Modified",
+			Status:       "Needs Resolution",
+		},
+		Base:   &Definition{Name: "other", Kind: "function", Body: "old"},
+		Local:  &Definition{Name: "other", Kind: "function", Body: "new1"},
+		Remote: &Definition{Name: "other", Kind: "function", Body: "new2"},
+	}
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			modifiedConflict,
+			makeDeleteConflictForFile("utils.py", "helper", moveBody),
+		}),
+		makeAnalysis("newutils.py", []SynthesisConflict{
+			makeAddConflictForFile("newutils.py", "helper", moveBody),
+		}),
+	}
+
+	moves := DetectInterFileMoves(analyses)
+
+	if len(moves) != 1 {
+		t.Fatalf("expected 1 inter-file move, got %d", len(moves))
+	}
+
+	// Should only match the orphans, not the modified conflict
+	if moves[0].SourceConflict.Base.Name != "helper" {
+		t.Errorf("should match 'helper', not '%s'", moves[0].SourceConflict.Base.Name)
+	}
+}
+
+// TestDetectInterFileMovesWithConfig_DisableExact tests disabling exact matching
+func TestDetectInterFileMovesWithConfig_DisableExact(t *testing.T) {
+	// Body needs >10 tokens for fuzzy matching to work
+	body := "def helper():\n    result = calculate_something(input_param)\n    processed = transform_data(result, config)\n    validated = check_output(processed)\n    return finalize_result(validated)"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", body),
+		}),
+		makeAnalysis("newutils.py", []SynthesisConflict{
+			makeAddConflictForFile("newutils.py", "helper", body),
+		}),
+	}
+
+	config := DefaultMoveDetectionConfig()
+	config.EnableExactMatch = false
+
+	moves := DetectInterFileMovesWithConfig(analyses, config)
+
+	// Should still match via fuzzy (identical bodies = 100% similarity)
+	if len(moves) != 1 {
+		t.Fatalf("expected 1 move via fuzzy, got %d", len(moves))
+	}
+
+	// Should be marked as fuzzy match
+	if moves[0].MatchType == "Exact Match" {
+		t.Error("should use fuzzy match when exact is disabled")
+	}
+}
+
+// TestDetectInterFileMovesWithConfig_DisableFuzzy tests disabling fuzzy matching
+func TestDetectInterFileMovesWithConfig_DisableFuzzy(t *testing.T) {
+	deleteBody := "def helper():\n    return calculate_something()\n    with_multiple_lines()"
+	addBody := "def helper():\n    return calculate_something_else()\n    with_different_lines()"
+
+	analyses := []*SynthesisAnalysis{
+		makeAnalysis("utils.py", []SynthesisConflict{
+			makeDeleteConflictForFile("utils.py", "helper", deleteBody),
+		}),
+		makeAnalysis("newutils.py", []SynthesisConflict{
+			makeAddConflictForFile("newutils.py", "helper", addBody),
+		}),
+	}
+
+	config := DefaultMoveDetectionConfig()
+	config.EnableFuzzyMatch = false
+
+	moves := DetectInterFileMovesWithConfig(analyses, config)
+
+	// Bodies are different so exact won't match, and fuzzy is disabled
+	if len(moves) != 0 {
+		t.Errorf("expected 0 moves (fuzzy disabled), got %d", len(moves))
+	}
+}
+
+// BenchmarkDetectInterFileMoves benchmarks inter-file move detection
+func BenchmarkDetectInterFileMoves(b *testing.B) {
+	// Create 10 files with 5 orphan conflicts each
+	var analyses []*SynthesisAnalysis
+
+	for i := 0; i < 5; i++ {
+		var conflicts []SynthesisConflict
+		for j := 0; j < 5; j++ {
+			body := strings.Repeat("def func_"+string(rune('A'+j))+"(): return value\n", 5)
+			conflicts = append(conflicts, makeDeleteConflictForFile(
+				"file"+string(rune('0'+i))+".py",
+				"func_"+string(rune('A'+j)),
+				body,
+			))
+		}
+		analyses = append(analyses, makeAnalysis("file"+string(rune('0'+i))+".py", conflicts))
+	}
+
+	for i := 5; i < 10; i++ {
+		var conflicts []SynthesisConflict
+		for j := 0; j < 5; j++ {
+			body := strings.Repeat("def func_"+string(rune('A'+j))+"(): return value\n", 5)
+			conflicts = append(conflicts, makeAddConflictForFile(
+				"file"+string(rune('0'+i))+".py",
+				"func_"+string(rune('A'+j)),
+				body,
+			))
+		}
+		analyses = append(analyses, makeAnalysis("file"+string(rune('0'+i))+".py", conflicts))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		DetectInterFileMoves(analyses)
+	}
+}

@@ -1,14 +1,17 @@
 package semantic
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/simonkoeck/g2/pkg/git"
+	"github.com/simonkoeck/g2/pkg/logging"
 	"github.com/simonkoeck/g2/pkg/ui"
 )
 
@@ -40,9 +43,13 @@ type SynthesisResult struct {
 
 // MergeConfig controls synthesis behavior
 type MergeConfig struct {
-	DryRun       bool // If true, print proposed changes but don't write
-	CreateBackup bool // If true, create .orig backup (default: true)
-	Verbose      bool // If true, print detailed progress
+	DryRun       bool          // If true, print proposed changes but don't write
+	CreateBackup bool          // If true, create .orig backup (default: true)
+	Verbose      bool          // If true, print detailed progress
+	JSONOutput   bool          // If true, output JSON instead of human-readable text
+	LogLevel     string        // Log level: debug, info, warn, error
+	GitTimeout   time.Duration // Timeout for git operations (0 = use default)
+	MaxFileSize  int64         // Maximum file size to process (0 = unlimited)
 }
 
 // DefaultMergeConfig returns safe defaults
@@ -51,6 +58,10 @@ func DefaultMergeConfig() MergeConfig {
 		DryRun:       false,
 		CreateBackup: true,
 		Verbose:      false,
+		JSONOutput:   false,
+		LogLevel:     "warn",
+		GitTimeout:   git.DefaultTimeout,
+		MaxFileSize:  0,
 	}
 }
 
@@ -222,8 +233,49 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 		}
 	}
 
+	// Case 1b: Added only in local (orphan add - for move detection)
+	if base == nil && local != nil && remote == nil {
+		return &SynthesisConflict{
+			UIConflict: ui.Conflict{
+				File:         file,
+				ConflictType: fmt.Sprintf("%s '%s' Added (local)", kindStr, name),
+				Status:       "Needs Resolution",
+			},
+			Local:  local,
+			Remote: nil,
+			Base:   nil,
+		}
+	}
+
+	// Case 1c: Added only in remote (orphan add - for move detection)
+	if base == nil && local == nil && remote != nil {
+		return &SynthesisConflict{
+			UIConflict: ui.Conflict{
+				File:         file,
+				ConflictType: fmt.Sprintf("%s '%s' Added (remote)", kindStr, name),
+				Status:       "Needs Resolution",
+			},
+			Local:  nil,
+			Remote: remote,
+			Base:   nil,
+		}
+	}
+
 	// Case 2: Removed in one branch, modified in other
 	if base != nil {
+		// Deleted on both branches (orphan delete - for move detection)
+		if local == nil && remote == nil {
+			return &SynthesisConflict{
+				UIConflict: ui.Conflict{
+					File:         file,
+					ConflictType: fmt.Sprintf("%s '%s' Deleted", kindStr, name),
+					Status:       "Needs Resolution",
+				},
+				Local:  nil,
+				Remote: nil,
+				Base:   base,
+			}
+		}
 		if local == nil && remote != nil && remoteNorm != baseNorm {
 			return &SynthesisConflict{
 				UIConflict: ui.Conflict{
@@ -392,8 +444,8 @@ func SynthesizeFile(analysis *SynthesisAnalysis, config MergeConfig) *SynthesisR
 
 	// If all conflicts were auto-merged, stage the file
 	if allAutoMerged {
-		cmd := exec.Command("git", "add", analysis.File)
-		if err := cmd.Run(); err != nil {
+		if err := gitExec.Run(context.Background(), "add", analysis.File); err != nil {
+			logging.Error("failed to stage file", "file", analysis.File, "error", err)
 			result.Success = false
 			result.Error = fmt.Errorf("failed to stage file: %w", err)
 			return result
@@ -448,6 +500,26 @@ func applyAutoMerge(canvas []byte, conflict *SynthesisConflict) []byte {
 
 		newBody := []byte(conflict.Remote.Body)
 		return replaceBytes(canvas, startByte, endByte, newBody)
+	}
+
+	// Move conflict: Local is nil (deleted), Remote has the renamed function
+	// Append the remote content to the end of the file
+	if conflict.Local == nil && conflict.Remote != nil {
+		// Ensure we have a newline before appending
+		newContent := conflict.Remote.Body
+		if len(canvas) > 0 && canvas[len(canvas)-1] != '\n' {
+			newContent = "\n" + newContent
+		}
+		// Add extra newline for separation
+		if len(canvas) > 0 {
+			newContent = "\n" + newContent
+		}
+		return append(canvas, []byte(newContent)...)
+	}
+
+	// Local-only addition (no remote) - keep local as-is
+	if conflict.Local != nil && conflict.Remote == nil {
+		return canvas
 	}
 
 	return canvas

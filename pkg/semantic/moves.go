@@ -292,3 +292,228 @@ func formatMoveConflictType(kind, deleteName, addName, matchType string, similar
 	}
 	return fmt.Sprintf("%s '%s' Renamed+Moved to '%s' (%.0f%% Match)", kind, deleteName, addName, similarity*100)
 }
+
+// InterFileMove represents a definition moved between files
+type InterFileMove struct {
+	SourceFile     string             // File where definition was deleted
+	DestFile       string             // File where definition was added
+	SourceConflict *SynthesisConflict // The orphan delete
+	DestConflict   *SynthesisConflict // The orphan add
+	MatchType      string             // "Exact Match" or "Fuzzy Match"
+	Similarity     float64            // 1.0 for exact, 0.0-1.0 for fuzzy
+}
+
+// CrossFileOrphan represents an orphan conflict from a specific file
+type CrossFileOrphan struct {
+	File     string
+	Conflict *SynthesisConflict
+}
+
+// DetectInterFileMoves identifies definitions moved between files
+// It looks for orphan deletes in one file that match orphan adds in another file
+func DetectInterFileMoves(analyses []*SynthesisAnalysis) []InterFileMove {
+	return DetectInterFileMovesWithConfig(analyses, DefaultMoveDetectionConfig())
+}
+
+// DetectInterFileMovesWithConfig identifies inter-file moves with custom configuration
+func DetectInterFileMovesWithConfig(analyses []*SynthesisAnalysis, config MoveDetectionConfig) []InterFileMove {
+	// Collect all orphan deletes and adds across files
+	var orphanDeletes, orphanAdds []CrossFileOrphan
+
+	for _, analysis := range analyses {
+		for i := range analysis.Conflicts {
+			c := &analysis.Conflicts[i]
+			if isOrphanDelete(c) {
+				orphanDeletes = append(orphanDeletes, CrossFileOrphan{
+					File:     analysis.File,
+					Conflict: c,
+				})
+			} else if isOrphanAdd(c) {
+				orphanAdds = append(orphanAdds, CrossFileOrphan{
+					File:     analysis.File,
+					Conflict: c,
+				})
+			}
+		}
+	}
+
+	// No potential inter-file moves if we don't have both deletes and adds
+	if len(orphanDeletes) == 0 || len(orphanAdds) == 0 {
+		return nil
+	}
+
+	// Track which conflicts have been matched
+	matchedDeletes := make(map[int]bool)
+	matchedAdds := make(map[int]bool)
+	var moves []InterFileMove
+
+	// Pass 1: Exact Match (across different files only)
+	if config.EnableExactMatch {
+		exactMoves := findExactInterFileMoves(orphanDeletes, orphanAdds, matchedDeletes, matchedAdds)
+		moves = append(moves, exactMoves...)
+	}
+
+	// Pass 2: Fuzzy Match (across different files only)
+	if config.EnableFuzzyMatch {
+		fuzzyMoves := findFuzzyInterFileMoves(orphanDeletes, orphanAdds, matchedDeletes, matchedAdds, config)
+		moves = append(moves, fuzzyMoves...)
+	}
+
+	return moves
+}
+
+// findExactInterFileMoves finds inter-file moves with identical bodies
+func findExactInterFileMoves(deletes, adds []CrossFileOrphan, matchedDeletes, matchedAdds map[int]bool) []InterFileMove {
+	var moves []InterFileMove
+
+	// Build hash index of orphan adds
+	addHashIndex := make(map[string][]int)
+	for i, add := range adds {
+		body := getAddBody(add.Conflict)
+		if body == "" {
+			continue
+		}
+		hash := hashBody(body)
+		addHashIndex[hash] = append(addHashIndex[hash], i)
+	}
+
+	// Match deletes to adds by hash (different files only)
+	for delIdx, del := range deletes {
+		if matchedDeletes[delIdx] {
+			continue
+		}
+
+		body := normalize(del.Conflict.Base.Body)
+		hash := hashBody(body)
+
+		for _, addIdx := range addHashIndex[hash] {
+			if matchedAdds[addIdx] {
+				continue
+			}
+
+			add := adds[addIdx]
+
+			// Only match across different files
+			if del.File == add.File {
+				continue
+			}
+
+			// Verify kinds match
+			if del.Conflict.Base.Kind != getAddKind(add.Conflict) {
+				continue
+			}
+
+			moves = append(moves, InterFileMove{
+				SourceFile:     del.File,
+				DestFile:       add.File,
+				SourceConflict: del.Conflict,
+				DestConflict:   add.Conflict,
+				MatchType:      "Exact Match",
+				Similarity:     1.0,
+			})
+			matchedDeletes[delIdx] = true
+			matchedAdds[addIdx] = true
+			break
+		}
+	}
+
+	return moves
+}
+
+// findFuzzyInterFileMoves finds inter-file moves with similar bodies
+func findFuzzyInterFileMoves(deletes, adds []CrossFileOrphan, matchedDeletes, matchedAdds map[int]bool, config MoveDetectionConfig) []InterFileMove {
+	var moves []InterFileMove
+
+	for delIdx, del := range deletes {
+		if matchedDeletes[delIdx] {
+			continue
+		}
+
+		delBody := normalize(del.Conflict.Base.Body)
+		delTokens := tokenize(delBody)
+
+		// Skip small bodies
+		if len(delTokens) < config.MinTokenCount {
+			continue
+		}
+
+		bestIdx := -1
+		bestSimilarity := 0.0
+
+		for addIdx, add := range adds {
+			if matchedAdds[addIdx] {
+				continue
+			}
+
+			// Only match across different files
+			if del.File == add.File {
+				continue
+			}
+
+			// Verify kinds match
+			if del.Conflict.Base.Kind != getAddKind(add.Conflict) {
+				continue
+			}
+
+			addBody := getAddBody(add.Conflict)
+			addTokens := tokenize(addBody)
+
+			// Skip small bodies
+			if len(addTokens) < config.MinTokenCount {
+				continue
+			}
+
+			similarity := calculateJaccard(delTokens, addTokens)
+			if similarity >= config.FuzzyThreshold && similarity > bestSimilarity {
+				bestIdx = addIdx
+				bestSimilarity = similarity
+			}
+		}
+
+		if bestIdx >= 0 {
+			add := adds[bestIdx]
+			moves = append(moves, InterFileMove{
+				SourceFile:     del.File,
+				DestFile:       add.File,
+				SourceConflict: del.Conflict,
+				DestConflict:   add.Conflict,
+				MatchType:      "Fuzzy Match",
+				Similarity:     bestSimilarity,
+			})
+			matchedDeletes[delIdx] = true
+			matchedAdds[bestIdx] = true
+		}
+	}
+
+	return moves
+}
+
+// ApplyInterFileMoves updates conflicts to reflect detected inter-file moves
+func ApplyInterFileMoves(analyses []*SynthesisAnalysis, moves []InterFileMove) {
+	for _, move := range moves {
+		kind := capitalizeFirst(move.SourceConflict.Base.Kind)
+		name := move.SourceConflict.Base.Name
+
+		// Format the match suffix
+		var matchSuffix string
+		if move.MatchType == "Exact Match" {
+			matchSuffix = "Exact Match"
+		} else {
+			matchSuffix = fmt.Sprintf("%.0f%% Match", move.Similarity*100)
+		}
+
+		// Update source conflict (the delete)
+		move.SourceConflict.UIConflict.Status = "Can Auto-merge"
+		move.SourceConflict.UIConflict.ConflictType = fmt.Sprintf(
+			"%s '%s' Moved to %s (%s)",
+			kind, name, move.DestFile, matchSuffix,
+		)
+
+		// Update dest conflict (the add)
+		move.DestConflict.UIConflict.Status = "Can Auto-merge"
+		move.DestConflict.UIConflict.ConflictType = fmt.Sprintf(
+			"%s '%s' Moved from %s (%s)",
+			kind, name, move.SourceFile, matchSuffix,
+		)
+	}
+}

@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -638,6 +639,303 @@ func makeConflict(name string, start, end uint32) SynthesisConflict {
 			StartByte: start,
 			EndByte:   end,
 		},
+	}
+}
+
+// =============================================================================
+// Inter-File Move Synthesis Tests
+// =============================================================================
+
+// TestApplyAutoMerge_InterFileMoveSourceDelete tests synthesis for the SOURCE side
+// of an inter-file move (the delete). The definition was deleted from the source file
+// and moved to another file. Synthesis should be a no-op (keep canvas unchanged).
+func TestApplyAutoMerge_InterFileMoveSourceDelete(t *testing.T) {
+	// Source file content after the definition was deleted locally
+	canvas := []byte("def other_func():\n    return 'other'\n")
+
+	// The inter-file move source conflict: Base is set (original location),
+	// but Local and Remote are nil (deleted in both branches)
+	conflict := &SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "utils.py",
+			ConflictType: "Function 'helper' Moved to newutils.py (Exact Match)",
+			Status:       "Can Auto-merge",
+		},
+		Base: &Definition{
+			Name:      "helper",
+			Kind:      "function",
+			Body:      "def helper():\n    return 'helping'\n",
+			StartByte: 0,  // Was at beginning before deletion
+			EndByte:   35,
+		},
+		Local:  nil, // Deleted locally
+		Remote: nil, // Deleted remotely
+	}
+
+	result := applyAutoMerge(canvas, conflict)
+
+	// Canvas should be unchanged - the delete is already in effect
+	if string(result) != string(canvas) {
+		t.Errorf("inter-file move source delete should not modify canvas\nexpected: %q\ngot: %q", canvas, result)
+	}
+}
+
+// TestApplyAutoMerge_InterFileMoveDestAddLocal tests synthesis for the DEST side
+// of an inter-file move where the definition was added in LOCAL branch.
+func TestApplyAutoMerge_InterFileMoveDestAddLocal(t *testing.T) {
+	// Dest file content with the definition added locally
+	canvas := []byte("def helper():\n    return 'helping'\n")
+
+	// The inter-file move dest conflict: Base is nil (didn't exist here before),
+	// Local is set (added locally)
+	conflict := &SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "newutils.py",
+			ConflictType: "Function 'helper' Moved from utils.py (Exact Match)",
+			Status:       "Can Auto-merge",
+		},
+		Base: nil, // Didn't exist in base
+		Local: &Definition{
+			Name:      "helper",
+			Kind:      "function",
+			Body:      "def helper():\n    return 'helping'\n",
+			StartByte: 0,
+			EndByte:   35,
+		},
+		Remote: nil, // Not added on remote in this scenario
+	}
+
+	result := applyAutoMerge(canvas, conflict)
+
+	// Canvas should be unchanged - local addition is already in place
+	if string(result) != string(canvas) {
+		t.Errorf("inter-file move dest add (local) should keep local content\nexpected: %q\ngot: %q", canvas, result)
+	}
+}
+
+// TestApplyAutoMerge_InterFileMoveDestAddRemote tests synthesis for the DEST side
+// of an inter-file move where the definition was added in REMOTE branch only.
+func TestApplyAutoMerge_InterFileMoveDestAddRemote(t *testing.T) {
+	// Dest file content - empty or has other content, but no helper yet
+	canvas := []byte("# newutils.py\n")
+
+	// The inter-file move dest conflict: Base is nil, Remote is set
+	conflict := &SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "newutils.py",
+			ConflictType: "Function 'helper' Moved from utils.py (Exact Match)",
+			Status:       "Can Auto-merge",
+		},
+		Base:  nil, // Didn't exist in base
+		Local: nil, // Not in local yet
+		Remote: &Definition{
+			Name: "helper",
+			Kind: "function",
+			Body: "def helper():\n    return 'helping'\n",
+		},
+	}
+
+	result := applyAutoMerge(canvas, conflict)
+
+	// Should append remote content
+	if !strings.Contains(string(result), "def helper()") {
+		t.Errorf("inter-file move dest add (remote) should append remote content\ngot: %q", result)
+	}
+	if !strings.Contains(string(result), "# newutils.py") {
+		t.Errorf("should preserve original canvas content\ngot: %q", result)
+	}
+}
+
+// TestApplyAutoMerge_InterFileMoveDestAddBothIdentical tests synthesis when both
+// branches added the definition to the dest file (identical content).
+func TestApplyAutoMerge_InterFileMoveDestAddBothIdentical(t *testing.T) {
+	canvas := []byte("def helper():\n    return 'helping'\n")
+
+	// Both branches added the same definition
+	conflict := &SynthesisConflict{
+		UIConflict: ui.Conflict{
+			File:         "newutils.py",
+			ConflictType: "Function 'helper' Moved from utils.py (Exact Match)",
+			Status:       "Can Auto-merge",
+		},
+		Base: nil,
+		Local: &Definition{
+			Name:      "helper",
+			Kind:      "function",
+			Body:      "def helper():\n    return 'helping'\n",
+			StartByte: 0,
+			EndByte:   35,
+		},
+		Remote: &Definition{
+			Name: "helper",
+			Kind: "function",
+			Body: "def helper():\n    return 'helping'\n",
+		},
+	}
+
+	result := applyAutoMerge(canvas, conflict)
+
+	// Should keep local (identical, no change needed)
+	if string(result) != string(canvas) {
+		t.Errorf("identical additions should not change canvas\nexpected: %q\ngot: %q", canvas, result)
+	}
+}
+
+// TestSynthesizeFile_InterFileMoveSource tests full synthesis for source file of inter-file move
+func TestSynthesizeFile_InterFileMoveSource(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "g2-interfile-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize git repo and change to it (needed because SynthesizeFile runs git add)
+	cleanup := initGitRepo(t, tmpDir)
+	defer cleanup()
+
+	// Use relative path since we're now in tmpDir
+	testFile := "utils.py"
+	// Content after helper() was deleted - only other_func remains
+	localContent := []byte("def other_func():\n    return 'other'\n")
+
+	if err := os.WriteFile(testFile, localContent, 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	analysis := &SynthesisAnalysis{
+		File: testFile,
+		Conflicts: []SynthesisConflict{
+			{
+				UIConflict: ui.Conflict{
+					File:         testFile,
+					ConflictType: "Function 'helper' Moved to newutils.py (Exact Match)",
+					Status:       "Can Auto-merge",
+				},
+				Base: &Definition{
+					Name:      "helper",
+					Kind:      "function",
+					Body:      "def helper():\n    return 'helping'\n",
+					StartByte: 0,
+					EndByte:   35,
+				},
+				Local:  nil,
+				Remote: nil,
+			},
+		},
+		LocalContent: localContent,
+	}
+
+	config := DefaultMergeConfig()
+	config.CreateBackup = false
+
+	result := SynthesizeFile(analysis, config)
+
+	if !result.Success {
+		t.Errorf("synthesis should succeed: %v", result.Error)
+	}
+	if !result.AllAutoMerged {
+		t.Error("inter-file move source should be auto-merged")
+	}
+
+	// File content should be unchanged (delete already in effect)
+	content, _ := os.ReadFile(testFile)
+	if string(content) != string(localContent) {
+		t.Errorf("source file should be unchanged\nexpected: %q\ngot: %q", localContent, content)
+	}
+}
+
+// TestSynthesizeFile_InterFileMoveDestRemote tests full synthesis for dest file
+// when the definition was added on the remote branch
+func TestSynthesizeFile_InterFileMoveDestRemote(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "g2-interfile-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Initialize git repo and change to it (needed because SynthesizeFile runs git add)
+	cleanup := initGitRepo(t, tmpDir)
+	defer cleanup()
+
+	// Use relative path since we're now in tmpDir
+	testFile := "newutils.py"
+	// Local content - file exists but doesn't have the helper function yet
+	localContent := []byte("# New utilities module\n")
+
+	if err := os.WriteFile(testFile, localContent, 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	analysis := &SynthesisAnalysis{
+		File: testFile,
+		Conflicts: []SynthesisConflict{
+			{
+				UIConflict: ui.Conflict{
+					File:         testFile,
+					ConflictType: "Function 'helper' Moved from utils.py (Exact Match)",
+					Status:       "Can Auto-merge",
+				},
+				Base:  nil,
+				Local: nil,
+				Remote: &Definition{
+					Name: "helper",
+					Kind: "function",
+					Body: "def helper():\n    return 'helping'",
+				},
+			},
+		},
+		LocalContent: localContent,
+	}
+
+	config := DefaultMergeConfig()
+	config.CreateBackup = false
+
+	result := SynthesizeFile(analysis, config)
+
+	if !result.Success {
+		t.Errorf("synthesis should succeed: %v", result.Error)
+	}
+	if !result.AllAutoMerged {
+		t.Error("inter-file move dest should be auto-merged")
+	}
+
+	// File content should now include the helper function
+	content, _ := os.ReadFile(testFile)
+	if !strings.Contains(string(content), "def helper()") {
+		t.Errorf("dest file should contain helper function\ngot: %q", content)
+	}
+	if !strings.Contains(string(content), "# New utilities module") {
+		t.Errorf("dest file should preserve original content\ngot: %q", content)
+	}
+}
+
+// initGitRepo initializes a git repo in the given directory and changes to it
+// Returns a cleanup function that restores the original directory
+func initGitRepo(t *testing.T, dir string) func() {
+	t.Helper()
+
+	// Save current directory
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get current dir: %v", err)
+	}
+
+	// Change to temp dir (git add needs to run from within the repo)
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("failed to change to temp dir: %v", err)
+	}
+
+	cmd := exec.Command("git", "init")
+	if err := cmd.Run(); err != nil {
+		os.Chdir(origDir)
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+	// Configure git user for commits
+	exec.Command("git", "config", "user.email", "test@test.com").Run()
+	exec.Command("git", "config", "user.name", "Test").Run()
+
+	return func() {
+		os.Chdir(origDir)
 	}
 }
 
