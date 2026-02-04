@@ -164,6 +164,9 @@ func AnalyzeConflictForSynthesis(file string) *SynthesisAnalysis {
 		}
 	}
 
+	// Detect and consolidate move operations (delete + add of same definition)
+	result.Conflicts = DetectMoves(result.Conflicts)
+
 	return result
 }
 
