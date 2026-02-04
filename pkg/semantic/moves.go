@@ -1,11 +1,7 @@
 package semantic
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"strings"
-	"unicode"
 
 	"github.com/simonkoeck/g2/pkg/ui"
 )
@@ -41,20 +37,7 @@ func DetectMovesWithConfig(conflicts []SynthesisConflict, config MoveDetectionCo
 	}
 
 	// Separate orphan deletes and adds from other conflicts
-	var orphanDeletes []*SynthesisConflict
-	var orphanAdds []*SynthesisConflict
-	var otherConflicts []SynthesisConflict
-
-	for i := range conflicts {
-		c := &conflicts[i]
-		if isOrphanDelete(c) {
-			orphanDeletes = append(orphanDeletes, c)
-		} else if isOrphanAdd(c) {
-			orphanAdds = append(orphanAdds, c)
-		} else {
-			otherConflicts = append(otherConflicts, *c)
-		}
-	}
+	orphanDeletes, orphanAdds, otherConflicts := classifyConflicts(conflicts)
 
 	// No potential moves if we don't have both deletes and adds
 	if len(orphanDeletes) == 0 || len(orphanAdds) == 0 {
@@ -68,121 +51,159 @@ func DetectMovesWithConfig(conflicts []SynthesisConflict, config MoveDetectionCo
 
 	// Pass 1: Exact Match
 	if config.EnableExactMatch {
-		// Build hash index of orphan adds
-		addHashIndex := make(map[string][]int) // hash -> indices in orphanAdds
-		for i, add := range orphanAdds {
-			body := getAddBody(add)
-			if body == "" {
-				continue
-			}
-			hash := hashBody(body)
-			addHashIndex[hash] = append(addHashIndex[hash], i)
-		}
-
-		// Match deletes to adds by hash
-		for delIdx, del := range orphanDeletes {
-			if matchedDeletes[delIdx] {
-				continue
-			}
-
-			body := normalize(del.Base.Body)
-			hash := hashBody(body)
-
-			// Find matching add
-			for _, addIdx := range addHashIndex[hash] {
-				if matchedAdds[addIdx] {
-					continue
-				}
-
-				add := orphanAdds[addIdx]
-
-				// Verify kinds match
-				if del.Base.Kind != getAddKind(add) {
-					continue
-				}
-
-				// Create move conflict
-				moveConflict := createMoveConflict(del, add, "Exact Match", 1.0)
-				moveConflicts = append(moveConflicts, moveConflict)
-
-				matchedDeletes[delIdx] = true
-				matchedAdds[addIdx] = true
-				break
-			}
-		}
+		exactMatches := findExactMatches(orphanDeletes, orphanAdds, matchedDeletes, matchedAdds)
+		moveConflicts = append(moveConflicts, exactMatches...)
 	}
 
 	// Pass 2: Fuzzy Match
 	if config.EnableFuzzyMatch {
-		for delIdx, del := range orphanDeletes {
-			if matchedDeletes[delIdx] {
-				continue
-			}
-
-			delBody := normalize(del.Base.Body)
-			delTokens := tokenize(delBody)
-
-			// Skip small bodies (boilerplate guard)
-			if len(delTokens) < config.MinTokenCount {
-				continue
-			}
-
-			var bestMatch struct {
-				addIdx     int
-				similarity float64
-			}
-			bestMatch.addIdx = -1
-
-			for addIdx, add := range orphanAdds {
-				if matchedAdds[addIdx] {
-					continue
-				}
-
-				// Verify kinds match
-				if del.Base.Kind != getAddKind(add) {
-					continue
-				}
-
-				addBody := getAddBody(add)
-				addTokens := tokenize(addBody)
-
-				// Skip small bodies
-				if len(addTokens) < config.MinTokenCount {
-					continue
-				}
-
-				similarity := calculateJaccard(delTokens, addTokens)
-				if similarity >= config.FuzzyThreshold && similarity > bestMatch.similarity {
-					bestMatch.addIdx = addIdx
-					bestMatch.similarity = similarity
-				}
-			}
-
-			if bestMatch.addIdx >= 0 {
-				add := orphanAdds[bestMatch.addIdx]
-				moveConflict := createMoveConflict(del, add, "Fuzzy Match", bestMatch.similarity)
-				moveConflicts = append(moveConflicts, moveConflict)
-
-				matchedDeletes[delIdx] = true
-				matchedAdds[bestMatch.addIdx] = true
-			}
-		}
+		fuzzyMatches := findFuzzyMatches(orphanDeletes, orphanAdds, matchedDeletes, matchedAdds, config)
+		moveConflicts = append(moveConflicts, fuzzyMatches...)
 	}
 
 	// Build result: other conflicts + move conflicts + unmatched orphans
-	result := make([]SynthesisConflict, 0, len(conflicts))
-	result = append(result, otherConflicts...)
-	result = append(result, moveConflicts...)
+	return assembleResult(otherConflicts, moveConflicts, orphanDeletes, orphanAdds, matchedDeletes, matchedAdds)
+}
+
+// classifyConflicts separates conflicts into orphan deletes, orphan adds, and others
+func classifyConflicts(conflicts []SynthesisConflict) (deletes, adds []*SynthesisConflict, others []SynthesisConflict) {
+	for i := range conflicts {
+		c := &conflicts[i]
+		if isOrphanDelete(c) {
+			deletes = append(deletes, c)
+		} else if isOrphanAdd(c) {
+			adds = append(adds, c)
+		} else {
+			others = append(others, *c)
+		}
+	}
+	return
+}
+
+// findExactMatches finds conflicts with identical bodies using hash comparison
+func findExactMatches(deletes, adds []*SynthesisConflict, matchedDeletes, matchedAdds map[int]bool) []SynthesisConflict {
+	var matches []SynthesisConflict
+
+	// Build hash index of orphan adds
+	addHashIndex := make(map[string][]int)
+	for i, add := range adds {
+		body := getAddBody(add)
+		if body == "" {
+			continue
+		}
+		hash := hashBody(body)
+		addHashIndex[hash] = append(addHashIndex[hash], i)
+	}
+
+	// Match deletes to adds by hash
+	for delIdx, del := range deletes {
+		if matchedDeletes[delIdx] {
+			continue
+		}
+
+		body := normalize(del.Base.Body)
+		hash := hashBody(body)
+
+		for _, addIdx := range addHashIndex[hash] {
+			if matchedAdds[addIdx] {
+				continue
+			}
+
+			add := adds[addIdx]
+
+			// Verify kinds match
+			if del.Base.Kind != getAddKind(add) {
+				continue
+			}
+
+			matches = append(matches, createMoveConflict(del, add, "Exact Match", 1.0))
+			matchedDeletes[delIdx] = true
+			matchedAdds[addIdx] = true
+			break
+		}
+	}
+
+	return matches
+}
+
+// findFuzzyMatches finds conflicts with similar bodies using Jaccard similarity
+func findFuzzyMatches(deletes, adds []*SynthesisConflict, matchedDeletes, matchedAdds map[int]bool, config MoveDetectionConfig) []SynthesisConflict {
+	var matches []SynthesisConflict
+
+	for delIdx, del := range deletes {
+		if matchedDeletes[delIdx] {
+			continue
+		}
+
+		delBody := normalize(del.Base.Body)
+		delTokens := tokenize(delBody)
+
+		// Skip small bodies (boilerplate guard)
+		if len(delTokens) < config.MinTokenCount {
+			continue
+		}
+
+		bestIdx, bestSimilarity := findBestFuzzyMatch(del, adds, delTokens, matchedAdds, config)
+
+		if bestIdx >= 0 {
+			add := adds[bestIdx]
+			matches = append(matches, createMoveConflict(del, add, "Fuzzy Match", bestSimilarity))
+			matchedDeletes[delIdx] = true
+			matchedAdds[bestIdx] = true
+		}
+	}
+
+	return matches
+}
+
+// findBestFuzzyMatch finds the best fuzzy match for a delete among adds
+func findBestFuzzyMatch(del *SynthesisConflict, adds []*SynthesisConflict, delTokens []string, matchedAdds map[int]bool, config MoveDetectionConfig) (int, float64) {
+	bestIdx := -1
+	bestSimilarity := 0.0
+
+	for addIdx, add := range adds {
+		if matchedAdds[addIdx] {
+			continue
+		}
+
+		// Verify kinds match
+		if del.Base.Kind != getAddKind(add) {
+			continue
+		}
+
+		addBody := getAddBody(add)
+		addTokens := tokenize(addBody)
+
+		// Skip small bodies
+		if len(addTokens) < config.MinTokenCount {
+			continue
+		}
+
+		similarity := calculateJaccard(delTokens, addTokens)
+		if similarity >= config.FuzzyThreshold && similarity > bestSimilarity {
+			bestIdx = addIdx
+			bestSimilarity = similarity
+		}
+	}
+
+	return bestIdx, bestSimilarity
+}
+
+// assembleResult combines all conflict types into the final result
+func assembleResult(others, moves []SynthesisConflict, deletes, adds []*SynthesisConflict, matchedDeletes, matchedAdds map[int]bool) []SynthesisConflict {
+	result := make([]SynthesisConflict, 0, len(others)+len(moves)+len(deletes)+len(adds))
+	result = append(result, others...)
+	result = append(result, moves...)
 
 	// Add unmatched orphan deletes
-	for i, del := range orphanDeletes {
+	for i, del := range deletes {
 		if !matchedDeletes[i] {
 			result = append(result, *del)
 		}
 	}
 
 	// Add unmatched orphan adds
-	for i, add := range orphanAdds {
+	for i, add := range adds {
 		if !matchedAdds[i] {
 			result = append(result, *add)
 		}
@@ -236,102 +257,13 @@ func getAddName(c *SynthesisConflict) string {
 	return ""
 }
 
-// hashBody returns SHA-256 hash of normalized body for exact matching
-func hashBody(body string) string {
-	normalized := normalize(body)
-	hash := sha256.Sum256([]byte(normalized))
-	return hex.EncodeToString(hash[:])
-}
-
-// tokenize splits a string into alphanumeric token sequences
-func tokenize(s string) []string {
-	var tokens []string
-	var current strings.Builder
-
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-			current.WriteRune(r)
-		} else {
-			if current.Len() > 0 {
-				tokens = append(tokens, current.String())
-				current.Reset()
-			}
-		}
-	}
-
-	// Don't forget the last token
-	if current.Len() > 0 {
-		tokens = append(tokens, current.String())
-	}
-
-	return tokens
-}
-
-// calculateJaccard computes Jaccard similarity coefficient between two token sets
-func calculateJaccard(tokens1, tokens2 []string) float64 {
-	if len(tokens1) == 0 && len(tokens2) == 0 {
-		return 1.0
-	}
-	if len(tokens1) == 0 || len(tokens2) == 0 {
-		return 0.0
-	}
-
-	// Build sets
-	set1 := make(map[string]bool)
-	for _, t := range tokens1 {
-		set1[t] = true
-	}
-
-	set2 := make(map[string]bool)
-	for _, t := range tokens2 {
-		set2[t] = true
-	}
-
-	// Calculate intersection
-	intersection := 0
-	for t := range set1 {
-		if set2[t] {
-			intersection++
-		}
-	}
-
-	// Calculate union
-	union := len(set1)
-	for t := range set2 {
-		if !set1[t] {
-			union++
-		}
-	}
-
-	if union == 0 {
-		return 0.0
-	}
-
-	return float64(intersection) / float64(union)
-}
-
 // createMoveConflict creates a merged conflict representing a move operation
 func createMoveConflict(del, add *SynthesisConflict, matchType string, similarity float64) SynthesisConflict {
 	deleteName := del.Base.Name
 	addName := getAddName(add)
 	kind := capitalizeFirst(del.Base.Kind)
 
-	var conflictType string
-	if deleteName == addName {
-		// Same name - simple move
-		if matchType == "Exact Match" {
-			conflictType = fmt.Sprintf("%s '%s' Moved (Exact Match)", kind, deleteName)
-		} else {
-			conflictType = fmt.Sprintf("%s '%s' Moved (%.0f%% Match)", kind, deleteName, similarity*100)
-		}
-	} else {
-		// Different names - rename + move
-		if matchType == "Exact Match" {
-			conflictType = fmt.Sprintf("%s '%s' Renamed+Moved to '%s' (Exact Match)", kind, deleteName, addName)
-		} else {
-			conflictType = fmt.Sprintf("%s '%s' Renamed+Moved to '%s' (%.0f%% Match)", kind, deleteName, addName, similarity*100)
-		}
-	}
+	conflictType := formatMoveConflictType(kind, deleteName, addName, matchType, similarity)
 
 	return SynthesisConflict{
 		UIConflict: ui.Conflict{
@@ -339,8 +271,24 @@ func createMoveConflict(del, add *SynthesisConflict, matchType string, similarit
 			ConflictType: conflictType,
 			Status:       "Can Auto-merge",
 		},
-		Base:   del.Base,   // Source location (the delete)
-		Local:  add.Local,  // Destination (the add)
-		Remote: add.Remote, // Destination (the add)
+		Base:   del.Base,
+		Local:  add.Local,
+		Remote: add.Remote,
 	}
+}
+
+// formatMoveConflictType formats the conflict type string for a move
+func formatMoveConflictType(kind, deleteName, addName, matchType string, similarity float64) string {
+	if deleteName == addName {
+		if matchType == "Exact Match" {
+			return fmt.Sprintf("%s '%s' Moved (Exact Match)", kind, deleteName)
+		}
+		return fmt.Sprintf("%s '%s' Moved (%.0f%% Match)", kind, deleteName, similarity*100)
+	}
+
+	// Different names - rename + move
+	if matchType == "Exact Match" {
+		return fmt.Sprintf("%s '%s' Renamed+Moved to '%s' (Exact Match)", kind, deleteName, addName)
+	}
+	return fmt.Sprintf("%s '%s' Renamed+Moved to '%s' (%.0f%% Match)", kind, deleteName, addName, similarity*100)
 }
