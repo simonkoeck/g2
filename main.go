@@ -48,12 +48,35 @@ func smartMerge(args []string) {
 		os.Exit(128)
 	}
 
+	// Parse g2-specific flags and filter them out for git
+	config := semantic.DefaultMergeConfig()
+	var gitArgs []string
+	for _, arg := range args {
+		switch arg {
+		case "--dry-run":
+			config.DryRun = true
+		case "--verbose", "-v":
+			config.Verbose = true
+		case "--no-backup":
+			config.CreateBackup = false
+		default:
+			gitArgs = append(gitArgs, arg)
+		}
+	}
+
 	// Display header
 	ui.Header("G2 Smart Merge")
 
+	// In dry-run mode, we still need to run git merge to detect conflicts
+	// but we won't write any synthesized changes
+	if config.DryRun {
+		ui.Info("Dry-run mode: no files will be modified")
+		fmt.Println()
+	}
+
 	// Run git merge
 	ui.Step("Running git merge...")
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -125,20 +148,6 @@ func smartMerge(args []string) {
 	}
 
 	ui.Summary(needsResolution, len(allConflicts))
-
-	// Parse merge config from args
-	config := semantic.DefaultMergeConfig()
-	for _, arg := range args {
-		if arg == "--dry-run" {
-			config.DryRun = true
-		}
-		if arg == "--verbose" || arg == "-v" {
-			config.Verbose = true
-		}
-		if arg == "--no-backup" {
-			config.CreateBackup = false
-		}
-	}
 
 	// Synthesize files
 	fmt.Println()
