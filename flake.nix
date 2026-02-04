@@ -19,8 +19,11 @@
 
             src = ./.;
 
-            # Hash for Go module dependencies (set to "" to get correct hash on first build)
+            # Hash for Go module dependencies
             vendorHash = "sha256-tiPnv/kMN7tQcyFr/SrxQeFxHJGtT6pFUH5t+k4w0aM=";
+
+            # Git is needed for tests
+            nativeCheckInputs = [ pkgs.git ];
 
             meta = with pkgs.lib; {
               description = "Smart Git merge with semantic conflict resolution";
