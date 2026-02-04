@@ -1,1 +1,1 @@
-def foo(): pass
+def foo(): return 2
