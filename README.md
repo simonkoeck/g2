@@ -63,6 +63,30 @@ g2 merge feature-branch
 | `--verbose` / `-v` | Show detailed analysis progress |
 | `--no-backup` | Skip creating `.orig` backup files |
 
+### Git Merge Driver (Automatic Integration)
+
+Instead of using `g2 merge`, you can configure Git to automatically use g2 for specific file types. This way, regular `git merge` commands will use g2's semantic merging.
+
+**Step 1: Configure the merge driver** (add to `~/.gitconfig`):
+
+```ini
+[merge "g2"]
+    name = G2 semantic merge driver
+    driver = g2 merge-driver %O %A %B %L %P
+```
+
+**Step 2: Enable for file types** (add to `.gitattributes` in your repo):
+
+```
+*.py merge=g2
+*.js merge=g2
+*.ts merge=g2
+*.tsx merge=g2
+*.jsx merge=g2
+```
+
+Now when you run `git merge feature-branch`, Git will automatically invoke g2 for Python/JS/TS files, giving you semantic conflict resolution without changing your workflow.
+
 ## Move Detection
 
 G2's standout feature is detecting when code is renamed or moved. When one branch deletes a function and another branch renames it, G2 recognizes they're the same code and auto-merges:

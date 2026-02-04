@@ -79,6 +79,9 @@ func main() {
 		os.Exit(smartRebase(args))
 	case "cherry-pick":
 		os.Exit(smartCherryPick(args))
+	case "merge-driver":
+		// Git merge driver mode - called by Git for individual files
+		os.Exit(mergeDriver(args[1:]))
 	case "continue":
 		// g2 continue - continue any in-progress operation
 		os.Exit(continueOperation())
@@ -103,6 +106,7 @@ COMMANDS:
     merge <branch>       Merge a branch with semantic conflict resolution
     rebase <branch>      Rebase onto a branch with semantic conflict resolution
     cherry-pick <commit> Cherry-pick commits with semantic conflict resolution
+    merge-driver         Git merge driver (called by Git, not directly)
     continue             Continue an in-progress operation after resolving conflicts
     abort                Abort an in-progress operation
     status               Show current operation status
@@ -125,6 +129,17 @@ EXAMPLES:
     g2 cherry-pick abc123
     g2 merge --dry-run feature-branch
     g2 merge --json feature-branch | jq .
+
+GIT MERGE DRIVER SETUP:
+    # Add to ~/.gitconfig:
+    [merge "g2"]
+        name = G2 semantic merge driver
+        driver = g2 merge-driver %O %A %B %L %P
+
+    # Add to .gitattributes:
+    *.py merge=g2
+    *.js merge=g2
+    *.ts merge=g2
 
 G2 automatically detects and resolves:
     - Function/class moves and renames
@@ -529,6 +544,77 @@ func smartCherryPick(args []string) int {
 
 	err := gitExec.RunWithStdio(ctx, gitArgs...)
 	return handleOperationResult(ctx, config, jsonResult, err, OpCherryPick)
+}
+
+// mergeDriver implements a Git merge driver
+// Called by Git with: g2 merge-driver %O %A %B %L %P
+// Where: %O=base, %A=local (ours), %B=remote (theirs), %L=conflict marker size, %P=path
+// Git expects the merged result written back to %A, exit 0=clean, 1=conflicts
+func mergeDriver(args []string) int {
+	if len(args) < 4 {
+		fmt.Fprintf(os.Stderr, "Usage: g2 merge-driver <base> <local> <remote> <marker-size> [path]\n")
+		return exitcode.GitError
+	}
+
+	basePath := args[0]
+	localPath := args[1]
+	remotePath := args[2]
+	// markerSize := args[3] // We don't use this currently
+	var filePath string
+	if len(args) >= 5 {
+		filePath = args[4]
+	} else {
+		filePath = localPath
+	}
+
+	// Read all three versions
+	baseContent, err := os.ReadFile(basePath)
+	if err != nil {
+		// Base might not exist for new files
+		baseContent = nil
+	}
+
+	localContent, err := os.ReadFile(localPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read local file %s: %v\n", localPath, err)
+		return exitcode.GitError
+	}
+
+	remoteContent, err := os.ReadFile(remotePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read remote file %s: %v\n", remotePath, err)
+		return exitcode.GitError
+	}
+
+	// Check if this is a semantic file type
+	if !semantic.IsSemanticFile(filePath) {
+		// Fall back to Git's default merge for non-semantic files
+		return 1 // Tell Git to use its default merge
+	}
+
+	// Analyze the conflict
+	analysis := semantic.AnalyzeConflictFromContents(filePath, baseContent, localContent, remoteContent)
+
+	// Detect moves within this file
+	analysis.Conflicts = semantic.DetectMoves(analysis.Conflicts)
+
+	// Synthesize the result
+	mergedContent, allAutoMerged, err := semantic.SynthesizeToBytes(analysis)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Synthesis error for %s: %v\n", filePath, err)
+		return exitcode.GitError
+	}
+
+	// Write the merged result back to the local file (Git expects this)
+	if err := os.WriteFile(localPath, mergedContent, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write merged result to %s: %v\n", localPath, err)
+		return exitcode.GitError
+	}
+
+	if allAutoMerged {
+		return 0 // Clean merge
+	}
+	return 1 // Conflicts remain (markers inserted)
 }
 
 // handleOperationResult handles the result of a git operation (merge/rebase/cherry-pick)

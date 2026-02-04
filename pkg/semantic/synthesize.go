@@ -827,3 +827,130 @@ func printDryRunDiff(filename string, original, proposed []byte) {
 
 	fmt.Println()
 }
+
+// AnalyzeConflictFromContents analyzes a file conflict from raw byte contents
+// This is used by the merge driver which receives file contents directly from Git
+func AnalyzeConflictFromContents(filePath string, baseContent, localContent, remoteContent []byte) *SynthesisAnalysis {
+	result := &SynthesisAnalysis{
+		File:         filePath,
+		Language:     DetectLanguage(filePath),
+		LocalContent: localContent,
+	}
+
+	// Handle binary files
+	if IsBinaryFile(localContent) || IsBinaryFile(remoteContent) {
+		result.Conflicts = append(result.Conflicts, SynthesisConflict{
+			UIConflict: ui.Conflict{
+				File:         filePath,
+				ConflictType: "Binary Conflict",
+				Status:       "Needs Resolution",
+			},
+		})
+		return result
+	}
+
+	// Parse all versions
+	var baseAnalysis, localAnalysis, remoteAnalysis *FileAnalysis
+
+	if len(baseContent) > 0 {
+		baseAnalysis = ParseFile(baseContent, result.Language)
+	} else {
+		baseAnalysis = &FileAnalysis{} // Empty base (new file)
+	}
+
+	localAnalysis = ParseFile(localContent, result.Language)
+	remoteAnalysis = ParseFile(remoteContent, result.Language)
+
+	// Check for parse errors
+	if localAnalysis.ParseError != nil || remoteAnalysis.ParseError != nil {
+		result.Conflicts = append(result.Conflicts, SynthesisConflict{
+			UIConflict: ui.Conflict{
+				File:         filePath,
+				ConflictType: "Parse Error",
+				Status:       "Needs Resolution",
+			},
+		})
+		return result
+	}
+
+	// Map definitions by name
+	baseDefs := mapDefinitions(baseAnalysis.Definitions)
+	localDefs := mapDefinitions(localAnalysis.Definitions)
+	remoteDefs := mapDefinitions(remoteAnalysis.Definitions)
+
+	// Find all unique definition names
+	allNames := make(map[string]bool)
+	for name := range baseDefs {
+		allNames[name] = true
+	}
+	for name := range localDefs {
+		allNames[name] = true
+	}
+	for name := range remoteDefs {
+		allNames[name] = true
+	}
+
+	// Analyze each definition
+	for name := range allNames {
+		baseDef := baseDefs[name]
+		localDef := localDefs[name]
+		remoteDef := remoteDefs[name]
+
+		conflict := analyzeSynthesisConflict(filePath, name, baseDef, localDef, remoteDef)
+		if conflict != nil {
+			result.Conflicts = append(result.Conflicts, *conflict)
+		}
+	}
+
+	// Detect and consolidate move operations
+	result.Conflicts = DetectMoves(result.Conflicts)
+
+	return result
+}
+
+// SynthesizeToBytes performs synthesis and returns the merged content as bytes
+// Returns (mergedContent, allAutoMerged, error)
+func SynthesizeToBytes(analysis *SynthesisAnalysis) ([]byte, bool, error) {
+	if len(analysis.Conflicts) == 0 {
+		return analysis.LocalContent, true, nil
+	}
+
+	if len(analysis.LocalContent) == 0 {
+		return nil, false, fmt.Errorf("no local content available for synthesis")
+	}
+
+	// Check for range collisions before processing
+	collisions := detectCollisions(analysis.Conflicts)
+	workingConflicts := analysis.Conflicts
+	if len(collisions) > 0 {
+		workingConflicts = handleCollisions(analysis.Conflicts, collisions)
+	}
+
+	// Sort conflicts by start byte descending (process from end to beginning)
+	sortedConflicts := make([]SynthesisConflict, len(workingConflicts))
+	copy(sortedConflicts, workingConflicts)
+	sort.Slice(sortedConflicts, func(i, j int) bool {
+		return getConflictStartByte(&sortedConflicts[i]) > getConflictStartByte(&sortedConflicts[j])
+	})
+
+	canvas := make([]byte, len(analysis.LocalContent))
+	copy(canvas, analysis.LocalContent)
+
+	allAutoMerged := true
+
+	for _, conflict := range sortedConflicts {
+		if conflict.UIConflict.Status == "Can Auto-merge" {
+			canvas = applyAutoMerge(canvas, &conflict)
+		} else if conflict.UserResolution == UserResolutionSkip {
+			allAutoMerged = false
+			canvas = insertConflictMarkers(canvas, &conflict)
+		} else if conflict.UserResolution != UserResolutionNone {
+			canvas = applyUserResolution(canvas, &conflict)
+		} else {
+			allAutoMerged = false
+			canvas = insertConflictMarkers(canvas, &conflict)
+		}
+	}
+
+	return canvas, allAutoMerged, nil
+}
