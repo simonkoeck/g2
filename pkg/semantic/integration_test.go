@@ -28,7 +28,7 @@ func runIntegrationTest(t *testing.T, scenario TestScenario) {
 	t.Helper()
 
 	// Create temp directory for test files
-	tmpDir, err := os.MkdirTemp("/tmp/claude", "semantic-integration-*")
+	tmpDir, err := os.MkdirTemp("", "semantic-integration-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
