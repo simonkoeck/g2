@@ -14,22 +14,22 @@ import (
 
 // ImportUpdate represents a required import change in a file
 type ImportUpdate struct {
-	File        string // File that needs import updated
-	OldImport   string // Original import statement
-	NewImport   string // Updated import statement
-	LineNumber  int    // Line number of the import (1-based)
-	StartByte   int    // Start byte offset
-	EndByte     int    // End byte offset
-	Definition  string // Name of the definition that moved
-	FromModule  string // Original module
-	ToModule    string // New module
+	File       string // File that needs import updated
+	OldImport  string // Original import statement
+	NewImport  string // Updated import statement
+	LineNumber int    // Line number of the import (1-based)
+	StartByte  int    // Start byte offset
+	EndByte    int    // End byte offset
+	Definition string // Name of the definition that moved
+	FromModule string // Original module
+	ToModule   string // New module
 }
 
 // ImportUpdateResult contains the outcome of applying import updates
 type ImportUpdateResult struct {
-	File          string
-	UpdatesCount  int
-	Error         error
+	File         string
+	UpdatesCount int
+	Error        error
 }
 
 // FindImportUpdates scans the repository for files that need import updates
@@ -163,10 +163,10 @@ func findPythonImportUpdates(file string, content []byte, moveMap map[struct{ so
 
 		// Check "from X import Y" style
 		if matches := pyFromImportRe.FindStringSubmatch(line); matches != nil {
-			prefix := matches[1]    // "from "
-			module := matches[2]    // module name
-			importKw := matches[3]  // " import "
-			names := matches[4]     // imported names
+			prefix := matches[1]   // "from "
+			module := matches[2]   // module name
+			importKw := matches[3] // " import "
+			names := matches[4]    // imported names
 
 			// Parse the imported names
 			importedNames := parseImportNames(names)

@@ -213,7 +213,7 @@ func extractPythonDefinitions(node *sitter.Node, content []byte, defs *[]Definit
 }
 
 func extractPythonFunction(node *sitter.Node, content []byte, classPrefix string) *Definition {
-	var name, params, body string
+	var name, params string
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
 		switch child.Type() {
@@ -221,18 +221,14 @@ func extractPythonFunction(node *sitter.Node, content []byte, classPrefix string
 			name = child.Content(content)
 		case "parameters":
 			params = child.Content(content)
-		case "block":
-			// Extract just the function body (indented block), not the signature
-			body = child.Content(content)
 		}
 	}
 	if name == "" {
 		return nil
 	}
-	// If we couldn't extract the body separately, fall back to full node content
-	if body == "" {
-		body = node.Content(content)
-	}
+
+	// Use full node content as body for accurate reconstruction
+	body := node.Content(content)
 
 	fullName := name
 	kind := "function"
@@ -390,7 +386,7 @@ func extractJSDefinitions(node *sitter.Node, content []byte, defs *[]Definition)
 }
 
 func extractJSFunction(node *sitter.Node, content []byte) *Definition {
-	var name, params, body string
+	var name, params string
 	for i := 0; i < int(node.NamedChildCount()); i++ {
 		child := node.NamedChild(i)
 		switch child.Type() {
@@ -398,18 +394,13 @@ func extractJSFunction(node *sitter.Node, content []byte) *Definition {
 			name = child.Content(content)
 		case "formal_parameters":
 			params = child.Content(content)
-		case "statement_block":
-			// Extract just the function body, not the signature
-			body = child.Content(content)
 		}
 	}
 	if name == "" {
 		return nil
 	}
-	// If we couldn't extract the body separately, fall back to full node content
-	if body == "" {
-		body = node.Content(content)
-	}
+	// Use full node content as body for accurate reconstruction
+	body := node.Content(content)
 	return &Definition{
 		Name:      name,
 		Kind:      "function",
@@ -478,8 +469,6 @@ func extractJSMethod(node *sitter.Node, content []byte, className string) *Defin
 			name = child.Content(content)
 		case "formal_parameters":
 			params = child.Content(content)
-		case "statement_block":
-			body = child.Content(content)
 		}
 	}
 
@@ -501,9 +490,8 @@ func extractJSMethod(node *sitter.Node, content []byte, className string) *Defin
 	if name == "" {
 		return nil
 	}
-	if body == "" {
-		body = node.Content(content)
-	}
+	// Use full node content as body for accurate reconstruction
+	body = nodeContent
 
 	fullName := className + "." + name
 	kind := "method"

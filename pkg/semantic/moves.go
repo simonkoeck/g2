@@ -18,6 +18,9 @@ type MoveDetectionConfig struct {
 	SmallBodyThreshold float64 // Stricter threshold for small bodies (default: 0.85)
 	LargeBodyTokens    int     // Bodies above this use lenient threshold (default: 100)
 	LargeBodyThreshold float64 // Lenient threshold for large bodies (default: 0.65)
+
+	// Weighted similarity (gives lower weight to common keywords)
+	UseWeightedSimilarity bool // Use weighted Jaccard instead of standard (default: false)
 }
 
 // DefaultMoveDetectionConfig returns default configuration
@@ -43,6 +46,14 @@ func getThresholdForSize(tokenCount int, config MoveDetectionConfig) float64 {
 		return config.LargeBodyThreshold
 	}
 	return config.FuzzyThreshold
+}
+
+// calculateSimilarity computes similarity using the configured method
+func calculateSimilarity(tokens1, tokens2 []string, config MoveDetectionConfig) float64 {
+	if config.UseWeightedSimilarity {
+		return calculateWeightedJaccard(tokens1, tokens2)
+	}
+	return calculateJaccard(tokens1, tokens2)
 }
 
 // DetectMoves identifies move operations among conflicts and consolidates them
@@ -210,7 +221,7 @@ func findBestFuzzyMatch(del *SynthesisConflict, adds []*SynthesisConflict, delTo
 			threshold = addThreshold
 		}
 
-		similarity := calculateJaccard(delTokens, addTokens)
+		similarity := calculateSimilarity(delTokens, addTokens, config)
 		if similarity >= threshold && similarity > bestSimilarity {
 			bestIdx = addIdx
 			bestSimilarity = similarity
@@ -468,6 +479,9 @@ func findFuzzyInterFileMoves(deletes, adds []CrossFileOrphan, matchedDeletes, ma
 			continue
 		}
 
+		// Get size-appropriate threshold for the delete body
+		delThreshold := getThresholdForSize(len(delTokens), config)
+
 		bestIdx := -1
 		bestSimilarity := 0.0
 
@@ -494,8 +508,15 @@ func findFuzzyInterFileMoves(deletes, adds []CrossFileOrphan, matchedDeletes, ma
 				continue
 			}
 
-			similarity := calculateJaccard(delTokens, addTokens)
-			if similarity >= config.FuzzyThreshold && similarity > bestSimilarity {
+			// Use the more restrictive threshold of the two bodies
+			addThreshold := getThresholdForSize(len(addTokens), config)
+			threshold := delThreshold
+			if addThreshold > threshold {
+				threshold = addThreshold
+			}
+
+			similarity := calculateSimilarity(delTokens, addTokens, config)
+			if similarity >= threshold && similarity > bestSimilarity {
 				bestIdx = addIdx
 				bestSimilarity = similarity
 			}

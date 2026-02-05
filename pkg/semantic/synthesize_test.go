@@ -478,7 +478,7 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 		local := &Definition{Kind: "function", Body: "def foo(): pass"}
 		remote := &Definition{Kind: "function", Body: "def foo(): pass"}
 
-		conflict := analyzeSynthesisConflict("test.py", "foo", nil, local, remote)
+		conflict := analyzeSynthesisConflict("test.py", "foo", nil, local, remote, LangPython)
 
 		if conflict == nil {
 			t.Fatal("expected conflict")
@@ -492,7 +492,7 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 		local := &Definition{Kind: "function", Body: "def foo(): return 1"}
 		remote := &Definition{Kind: "function", Body: "def foo(): return 2"}
 
-		conflict := analyzeSynthesisConflict("test.py", "foo", nil, local, remote)
+		conflict := analyzeSynthesisConflict("test.py", "foo", nil, local, remote, LangPython)
 
 		if conflict == nil {
 			t.Fatal("expected conflict")
@@ -507,7 +507,7 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 		local := &Definition{Kind: "function", Body: "def foo(): return 1"}
 		remote := &Definition{Kind: "function", Body: "def foo(): return 1"}
 
-		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote)
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote, LangPython)
 
 		if conflict == nil {
 			t.Fatal("expected conflict")
@@ -522,7 +522,7 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 		local := &Definition{Kind: "function", Body: "def foo():  return  1"} // extra spaces
 		remote := &Definition{Kind: "function", Body: "def foo(): return 1"}  // normal
 
-		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote)
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote, LangPython)
 
 		if conflict == nil {
 			t.Fatal("expected conflict")
@@ -539,7 +539,7 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 		base := &Definition{Kind: "function", Body: "def foo(): pass"}
 		remote := &Definition{Kind: "function", Body: "def foo(): return 1"}
 
-		conflict := analyzeSynthesisConflict("test.py", "foo", base, nil, remote)
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, nil, remote, LangPython)
 
 		if conflict == nil {
 			t.Fatal("expected conflict")
@@ -551,10 +551,10 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 
 	t.Run("remote only change - auto-mergeable", func(t *testing.T) {
 		base := &Definition{Kind: "function", Body: "def foo(): pass"}
-		local := &Definition{Kind: "function", Body: "def foo(): pass"}  // unchanged
+		local := &Definition{Kind: "function", Body: "def foo(): pass"} // unchanged
 		remote := &Definition{Kind: "function", Body: "def foo(): return 1"}
 
-		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote)
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote, LangPython)
 
 		if conflict == nil {
 			t.Fatal("expected conflict")
@@ -564,6 +564,124 @@ func TestAnalyzeSynthesisConflict(t *testing.T) {
 		}
 		if conflict.UIConflict.Status != "Can Auto-merge" {
 			t.Errorf("remote-only changes should be auto-mergeable")
+		}
+	})
+
+	// NEW TESTS for improved automerging
+
+	t.Run("local only change - auto-mergeable", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo(): pass"}
+		local := &Definition{Kind: "function", Body: "def foo(): return 1"}
+		remote := &Definition{Kind: "function", Body: "def foo(): pass"} // unchanged
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote, LangPython)
+
+		if conflict == nil {
+			t.Fatal("expected conflict")
+		}
+		if !strings.Contains(conflict.UIConflict.ConflictType, "Updated (local)") {
+			t.Errorf("should be 'Updated (local)', got: %s", conflict.UIConflict.ConflictType)
+		}
+		if conflict.UIConflict.Status != "Can Auto-merge" {
+			t.Errorf("local-only changes should be auto-mergeable")
+		}
+	})
+
+	t.Run("deleted in both branches - auto-mergeable", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo(): pass"}
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, nil, nil, LangPython)
+
+		if conflict == nil {
+			t.Fatal("expected conflict")
+		}
+		if !strings.Contains(conflict.UIConflict.ConflictType, "Deleted (both)") {
+			t.Errorf("should be 'Deleted (both)', got: %s", conflict.UIConflict.ConflictType)
+		}
+		if conflict.UIConflict.Status != "Can Auto-merge" {
+			t.Errorf("deletion agreement should be auto-mergeable")
+		}
+	})
+
+	t.Run("deleted locally, remote unchanged - auto-mergeable", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo(): pass"}
+		remote := &Definition{Kind: "function", Body: "def foo(): pass"} // unchanged from base
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, nil, remote, LangPython)
+
+		if conflict == nil {
+			t.Fatal("expected conflict")
+		}
+		if !strings.Contains(conflict.UIConflict.ConflictType, "Deleted (local)") {
+			t.Errorf("should be 'Deleted (local)', got: %s", conflict.UIConflict.ConflictType)
+		}
+		if conflict.UIConflict.Status != "Can Auto-merge" {
+			t.Errorf("local deletion with unchanged remote should be auto-mergeable")
+		}
+	})
+
+	t.Run("deleted remotely, local unchanged - auto-mergeable", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo(): pass"}
+		local := &Definition{Kind: "function", Body: "def foo(): pass"} // unchanged from base
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, nil, LangPython)
+
+		if conflict == nil {
+			t.Fatal("expected conflict")
+		}
+		if !strings.Contains(conflict.UIConflict.ConflictType, "Deleted (remote)") {
+			t.Errorf("should be 'Deleted (remote)', got: %s", conflict.UIConflict.ConflictType)
+		}
+		if conflict.UIConflict.Status != "Can Auto-merge" {
+			t.Errorf("remote deletion with unchanged local should be auto-mergeable")
+		}
+	})
+
+	t.Run("modify/delete conflict - needs resolution", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo(): pass"}
+		local := &Definition{Kind: "function", Body: "def foo(): return 1"} // modified
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, nil, LangPython)
+
+		if conflict == nil {
+			t.Fatal("expected conflict")
+		}
+		if !strings.Contains(conflict.UIConflict.ConflictType, "Modify/Delete") {
+			t.Errorf("should be 'Modify/Delete', got: %s", conflict.UIConflict.ConflictType)
+		}
+		if conflict.UIConflict.Status != "Needs Resolution" {
+			t.Errorf("modify/delete conflict should need resolution")
+		}
+	})
+
+	t.Run("comment-only change - auto-mergeable", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo():\n    return 1"}
+		local := &Definition{Kind: "function", Body: "def foo():\n    # local comment\n    return 1"}
+		remote := &Definition{Kind: "function", Body: "def foo():\n    # remote comment\n    return 1"}
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote, LangPython)
+
+		if conflict == nil {
+			t.Fatal("expected conflict")
+		}
+		if !strings.Contains(conflict.UIConflict.ConflictType, "Comment Change") {
+			t.Errorf("should be 'Comment Change', got: %s", conflict.UIConflict.ConflictType)
+		}
+		if conflict.UIConflict.Status != "Can Auto-merge" {
+			t.Errorf("comment-only changes should be auto-mergeable")
+		}
+	})
+
+	t.Run("no conflict - no change", func(t *testing.T) {
+		base := &Definition{Kind: "function", Body: "def foo(): pass"}
+		local := &Definition{Kind: "function", Body: "def foo(): pass"}
+		remote := &Definition{Kind: "function", Body: "def foo(): pass"}
+
+		conflict := analyzeSynthesisConflict("test.py", "foo", base, local, remote, LangPython)
+
+		// No changes = no conflict
+		if conflict != nil {
+			t.Errorf("no changes should produce no conflict, got: %v", conflict)
 		}
 	})
 }
@@ -623,6 +741,86 @@ func TestApplyAutoMerge(t *testing.T) {
 			t.Errorf("should apply remote change, got: %s", result)
 		}
 	})
+
+	t.Run("deleted both - no change to canvas", func(t *testing.T) {
+		// Canvas doesn't have the function (already deleted in local)
+		canvas := []byte("def other(): pass")
+		conflict := &SynthesisConflict{
+			Base:   &Definition{Body: "def foo(): pass", StartByte: 0, EndByte: 15},
+			Local:  nil, // deleted locally
+			Remote: nil, // deleted remotely
+		}
+
+		result := applyAutoMerge(canvas, conflict)
+		if string(result) != string(canvas) {
+			t.Errorf("deleted both should not change canvas, got: %s", result)
+		}
+	})
+
+	t.Run("deleted locally, remote unchanged - no change to canvas", func(t *testing.T) {
+		// Canvas doesn't have the function (local deleted it)
+		canvas := []byte("def other(): pass")
+		conflict := &SynthesisConflict{
+			Base:   &Definition{Body: "def foo(): pass"},
+			Local:  nil,                                  // deleted locally
+			Remote: &Definition{Body: "def foo(): pass"}, // unchanged from base
+		}
+
+		result := applyAutoMerge(canvas, conflict)
+		if string(result) != string(canvas) {
+			t.Errorf("deleted locally (remote unchanged) should not change canvas, got: %s", result)
+		}
+	})
+
+	t.Run("deleted remotely, local unchanged - removes from canvas", func(t *testing.T) {
+		// Canvas has the function (local kept it unchanged)
+		canvas := []byte("def foo(): pass\ndef bar(): pass")
+		conflict := &SynthesisConflict{
+			Base:   &Definition{Body: "def foo(): pass"},
+			Local:  &Definition{Body: "def foo(): pass", StartByte: 0, EndByte: 15}, // unchanged from base
+			Remote: nil,                                                             // deleted remotely
+		}
+
+		result := applyAutoMerge(canvas, conflict)
+		// Should remove def foo() from canvas
+		if strings.Contains(string(result), "def foo()") {
+			t.Errorf("deleted remotely should remove from canvas, got: %s", result)
+		}
+		if !strings.Contains(string(result), "def bar()") {
+			t.Errorf("should preserve other content, got: %s", result)
+		}
+	})
+
+	t.Run("local only addition - keeps local", func(t *testing.T) {
+		canvas := []byte("def foo(): return 1")
+		conflict := &SynthesisConflict{
+			Base:   nil,
+			Local:  &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+			Remote: nil,
+		}
+
+		result := applyAutoMerge(canvas, conflict)
+		if string(result) != string(canvas) {
+			t.Errorf("local only addition should keep local, got: %s", result)
+		}
+	})
+
+	t.Run("remote only addition - appends remote", func(t *testing.T) {
+		canvas := []byte("# existing content")
+		conflict := &SynthesisConflict{
+			Base:   nil,
+			Local:  nil,
+			Remote: &Definition{Body: "def new_func(): pass"},
+		}
+
+		result := applyAutoMerge(canvas, conflict)
+		if !strings.Contains(string(result), "# existing content") {
+			t.Errorf("should preserve existing content, got: %s", result)
+		}
+		if !strings.Contains(string(result), "def new_func()") {
+			t.Errorf("should append remote content, got: %s", result)
+		}
+	})
 }
 
 // Helper function to create test conflicts
@@ -665,7 +863,7 @@ func TestApplyAutoMerge_InterFileMoveSourceDelete(t *testing.T) {
 			Name:      "helper",
 			Kind:      "function",
 			Body:      "def helper():\n    return 'helping'\n",
-			StartByte: 0,  // Was at beginning before deletion
+			StartByte: 0, // Was at beginning before deletion
 			EndByte:   35,
 		},
 		Local:  nil, // Deleted locally
@@ -939,6 +1137,313 @@ func initGitRepo(t *testing.T, dir string) func() {
 	}
 }
 
+// TestSynthesizeToBytes tests the byte-level synthesis function
+func TestSynthesizeToBytes(t *testing.T) {
+	t.Run("empty conflicts returns local content", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File:         "test.py",
+			Conflicts:    []SynthesisConflict{},
+			LocalContent: []byte("original content"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !allMerged {
+			t.Error("empty conflicts should be all merged")
+		}
+		if string(result) != "original content" {
+			t.Errorf("expected original content, got: %s", result)
+		}
+	})
+
+	t.Run("no local content returns error", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				makeConflict("foo", 0, 10),
+			},
+			LocalContent: []byte{},
+		}
+
+		_, _, err := SynthesizeToBytes(analysis)
+
+		if err == nil {
+			t.Error("expected error for empty local content")
+		}
+	})
+
+	t.Run("auto-merge conflicts are resolved", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict: ui.Conflict{Status: "Can Auto-merge"},
+					Local:      &Definition{Body: "def foo(): pass", StartByte: 0, EndByte: 15},
+					Remote:     &Definition{Body: "def foo(): return 1"},
+				},
+			},
+			LocalContent: []byte("def foo(): pass"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !allMerged {
+			t.Error("auto-merge conflicts should all be merged")
+		}
+		if string(result) != "def foo(): return 1" {
+			t.Errorf("expected remote content, got: %s", result)
+		}
+	})
+
+	t.Run("manual conflicts get markers", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict: ui.Conflict{Status: "Needs Resolution"},
+					Local:      &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+					Remote:     &Definition{Body: "def foo(): return 2"},
+				},
+			},
+			LocalContent: []byte("def foo(): return 1"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if allMerged {
+			t.Error("manual conflicts should not be all merged")
+		}
+		if !strings.Contains(string(result), "<<<<<<< LOCAL") {
+			t.Error("should contain conflict markers")
+		}
+	})
+
+	t.Run("user resolution skip leaves markers", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict:     ui.Conflict{Status: "Needs Resolution"},
+					Local:          &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+					Remote:         &Definition{Body: "def foo(): return 2"},
+					UserResolution: UserResolutionSkip,
+				},
+			},
+			LocalContent: []byte("def foo(): return 1"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if allMerged {
+			t.Error("skip resolution should not be all merged")
+		}
+		if !strings.Contains(string(result), "<<<<<<< LOCAL") {
+			t.Error("skip should leave conflict markers")
+		}
+	})
+
+	t.Run("user resolution local keeps local", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict:     ui.Conflict{Status: "Needs Resolution"},
+					Local:          &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+					Remote:         &Definition{Body: "def foo(): return 2"},
+					UserResolution: UserResolutionLocal,
+				},
+			},
+			LocalContent: []byte("def foo(): return 1"),
+		}
+
+		result, _, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(result) != "def foo(): return 1" {
+			t.Errorf("expected local content, got: %s", result)
+		}
+	})
+
+	t.Run("user resolution remote applies remote", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict:     ui.Conflict{Status: "Needs Resolution"},
+					Local:          &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+					Remote:         &Definition{Body: "def foo(): return 2"},
+					UserResolution: UserResolutionRemote,
+				},
+			},
+			LocalContent: []byte("def foo(): return 1"),
+		}
+
+		result, _, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(result) != "def foo(): return 2" {
+			t.Errorf("expected remote content, got: %s", result)
+		}
+	})
+
+	t.Run("user resolution both keeps both", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict:     ui.Conflict{Status: "Needs Resolution"},
+					Local:          &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+					Remote:         &Definition{Body: "def bar(): return 2"},
+					UserResolution: UserResolutionBoth,
+				},
+			},
+			LocalContent: []byte("def foo(): return 1"),
+		}
+
+		result, _, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(result), "def foo()") {
+			t.Error("should contain local content")
+		}
+		if !strings.Contains(string(result), "def bar()") {
+			t.Error("should contain remote content")
+		}
+	})
+}
+
+// TestSynthesizeToBytes_NewAutoMergeCases tests new auto-merge scenarios
+func TestSynthesizeToBytes_NewAutoMergeCases(t *testing.T) {
+	t.Run("deleted both - canvas unchanged", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict: ui.Conflict{Status: "Can Auto-merge", ConflictType: "Deleted (both)"},
+					Base:       &Definition{Body: "def deleted(): pass"},
+					Local:      nil,
+					Remote:     nil,
+				},
+			},
+			LocalContent: []byte("def remaining(): pass"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !allMerged {
+			t.Error("deleted both should be auto-merged")
+		}
+		if string(result) != "def remaining(): pass" {
+			t.Errorf("canvas should be unchanged, got: %s", result)
+		}
+	})
+
+	t.Run("deleted remotely, local unchanged - removes from canvas", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict: ui.Conflict{Status: "Can Auto-merge", ConflictType: "Deleted (remote)"},
+					Base:       &Definition{Body: "def foo(): pass"},
+					Local:      &Definition{Body: "def foo(): pass", StartByte: 0, EndByte: 15},
+					Remote:     nil,
+				},
+			},
+			LocalContent: []byte("def foo(): pass\ndef bar(): pass"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !allMerged {
+			t.Error("deleted remote should be auto-merged")
+		}
+		if strings.Contains(string(result), "def foo()") {
+			t.Errorf("should remove deleted function, got: %s", result)
+		}
+		if !strings.Contains(string(result), "def bar()") {
+			t.Errorf("should preserve other functions, got: %s", result)
+		}
+	})
+
+	t.Run("deleted locally, remote unchanged - keeps canvas", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict: ui.Conflict{Status: "Can Auto-merge", ConflictType: "Deleted (local)"},
+					Base:       &Definition{Body: "def deleted(): pass"},
+					Local:      nil,
+					Remote:     &Definition{Body: "def deleted(): pass"},
+				},
+			},
+			LocalContent: []byte("def remaining(): pass"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !allMerged {
+			t.Error("deleted local should be auto-merged")
+		}
+		if string(result) != "def remaining(): pass" {
+			t.Errorf("canvas should be unchanged, got: %s", result)
+		}
+	})
+
+	t.Run("local only update - keeps local", func(t *testing.T) {
+		analysis := &SynthesisAnalysis{
+			File: "test.py",
+			Conflicts: []SynthesisConflict{
+				{
+					UIConflict: ui.Conflict{Status: "Can Auto-merge", ConflictType: "Updated (local)"},
+					Base:       &Definition{Body: "def foo(): pass"},
+					Local:      &Definition{Body: "def foo(): return 1", StartByte: 0, EndByte: 19},
+					Remote:     &Definition{Body: "def foo(): pass"},
+				},
+			},
+			LocalContent: []byte("def foo(): return 1"),
+		}
+
+		result, allMerged, err := SynthesizeToBytes(analysis)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !allMerged {
+			t.Error("local update should be auto-merged")
+		}
+		if string(result) != "def foo(): return 1" {
+			t.Errorf("should keep local changes, got: %s", result)
+		}
+	})
+}
+
 // TestSynthesizeFileIntegration tests the full synthesis flow
 func TestSynthesizeFileIntegration(t *testing.T) {
 	// Create temp directory
@@ -1132,4 +1637,121 @@ func TestSynthesizeFileIntegration(t *testing.T) {
 			t.Errorf("expected 1 conflict after collision handling, got %d", result.ConflictCount)
 		}
 	})
+}
+
+func TestApplyAutoMerge_OrphanAddAppend(t *testing.T) {
+	canvas := []byte("existing content\n")
+	
+	conflict := &SynthesisConflict{
+		UIConflict: ui.Conflict{
+			ConflictType: "Added (remote)",
+			Status:       "Can Auto-merge",
+		},
+		Local:  nil,
+		Remote: &Definition{
+			Name: "newKey",
+			Kind: "key",
+			Body: "newKey: value\n",
+		},
+		Base: nil,
+	}
+
+	result := applyAutoMerge(canvas, conflict)
+	
+	if !strings.Contains(string(result), "newKey: value") {
+		t.Errorf("expected result to contain appended content, got: %s", result)
+	}
+	if !strings.Contains(string(result), "existing content") {
+		t.Errorf("expected result to preserve existing content, got: %s", result)
+	}
+}
+
+// TestSynthesizeToBytes_MultipleConflictsWithOrphanAdd tests the scenario from YAML test
+func TestSynthesizeToBytes_MultipleConflictsWithOrphanAdd(t *testing.T) {
+	// Simulate YAML config scenario:
+	// - database: exists in base, local updated (added pool_size)
+	// - logging: new in remote (orphan add)
+	// - server: unchanged in all versions
+
+	localContent := `database:
+  host: localhost
+  port: 5432
+  pool_size: 10
+
+server:
+  host: 0.0.0.0
+  port: 8080
+`
+
+	analysis := &SynthesisAnalysis{
+		File:         "config.yaml",
+		Language:     LangYAML,
+		LocalContent: []byte(localContent),
+		Conflicts: []SynthesisConflict{
+			{
+				UIConflict: ui.Conflict{
+					ConflictType: "Key 'database' Updated (local)",
+					Status:       "Can Auto-merge",
+				},
+				Local: &Definition{
+					Name:      "database",
+					Kind:      "key",
+					Body:      "database:\n  host: localhost\n  port: 5432\n  pool_size: 10\n",
+					StartByte: 0,
+					EndByte:   55,
+				},
+				Remote: &Definition{
+					Name:      "database",
+					Kind:      "key",
+					Body:      "database:\n  host: localhost\n  port: 5432\n",
+					StartByte: 0,
+					EndByte:   42,
+				},
+				Base: &Definition{
+					Name:      "database",
+					Kind:      "key",
+					Body:      "database:\n  host: localhost\n  port: 5432\n",
+					StartByte: 0,
+					EndByte:   42,
+				},
+			},
+			{
+				UIConflict: ui.Conflict{
+					ConflictType: "Key 'logging' Added (remote)",
+					Status:       "Can Auto-merge",
+				},
+				Local:  nil, // Doesn't exist locally
+				Remote: &Definition{
+					Name:      "logging",
+					Kind:      "key",
+					Body:      "logging:\n  level: info\n  format: json\n",
+					StartByte: 0, // Doesn't matter for orphan adds
+					EndByte:   0,
+				},
+				Base: nil, // Doesn't exist in base
+			},
+		},
+	}
+
+	result, allAutoMerged, err := SynthesizeToBytes(analysis)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	t.Logf("allAutoMerged: %v", allAutoMerged)
+	t.Logf("Result:\n%s", string(result))
+
+	// Check that local changes are preserved
+	if !strings.Contains(string(result), "pool_size: 10") {
+		t.Error("expected result to contain local pool_size change")
+	}
+
+	// Check that orphan add was appended
+	if !strings.Contains(string(result), "logging:") {
+		t.Error("expected result to contain remote logging section")
+	}
+
+	if !strings.Contains(string(result), "level: info") {
+		t.Error("expected result to contain logging level")
+	}
 }

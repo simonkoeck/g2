@@ -283,3 +283,144 @@ func TestStripCommentsPreservesCode(t *testing.T) {
 		t.Errorf("code with different comments should normalize the same:\n  %q\n  %q", norm1, norm2)
 	}
 }
+
+// TestCalculateWeightedJaccard tests weighted Jaccard similarity
+func TestCalculateWeightedJaccard(t *testing.T) {
+	tests := []struct {
+		name            string
+		tokens1         []string
+		tokens2         []string
+		expectedMin     float64 // minimum expected similarity
+		expectedMax     float64 // maximum expected similarity
+		higherThanBasic bool    // should weighted be higher than basic?
+	}{
+		{
+			name:        "identical tokens",
+			tokens1:     []string{"foo", "bar", "baz"},
+			tokens2:     []string{"foo", "bar", "baz"},
+			expectedMin: 0.99,
+			expectedMax: 1.01,
+		},
+		{
+			name:        "no overlap",
+			tokens1:     []string{"foo", "bar"},
+			tokens2:     []string{"baz", "qux"},
+			expectedMin: -0.01,
+			expectedMax: 0.01,
+		},
+		{
+			name:        "both empty",
+			tokens1:     []string{},
+			tokens2:     []string{},
+			expectedMin: 0.99,
+			expectedMax: 1.01,
+		},
+		{
+			name:        "one empty",
+			tokens1:     []string{"foo"},
+			tokens2:     []string{},
+			expectedMin: -0.01,
+			expectedMax: 0.01,
+		},
+		{
+			name:    "common keywords get lower weight",
+			tokens1: []string{"if", "else", "return", "uniqueFunction"},
+			tokens2: []string{"if", "else", "return", "differentFunction"},
+			// Common keywords (if, else, return) have lower weight, so the mismatch
+			// on "uniqueFunction" vs "differentFunction" matters more
+			expectedMin:     0.2,
+			expectedMax:     0.6,
+			higherThanBasic: false, // weighted should be LOWER because unique tokens differ
+		},
+		{
+			name:    "unique tokens matching gives higher similarity",
+			tokens1: []string{"if", "else", "calculateTotalPrice"},
+			tokens2: []string{"for", "while", "calculateTotalPrice"},
+			// Common keywords differ but unique token matches
+			expectedMin:     0.3,
+			expectedMax:     0.8,
+			higherThanBasic: true, // weighted should be HIGHER because unique token matches
+		},
+		{
+			name:    "single character tokens get low weight",
+			tokens1: []string{"i", "j", "k", "complexAlgorithm"},
+			tokens2: []string{"x", "y", "z", "complexAlgorithm"},
+			// Single chars differ but important token matches
+			expectedMin:     0.3,
+			expectedMax:     0.9,
+			higherThanBasic: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := calculateWeightedJaccard(tt.tokens1, tt.tokens2)
+			if result < tt.expectedMin || result > tt.expectedMax {
+				t.Errorf("expected similarity between %f and %f, got %f", tt.expectedMin, tt.expectedMax, result)
+			}
+
+			if tt.higherThanBasic {
+				basic := calculateJaccard(tt.tokens1, tt.tokens2)
+				if result <= basic {
+					t.Errorf("weighted (%f) should be higher than basic (%f) when unique tokens match", result, basic)
+				}
+			}
+		})
+	}
+}
+
+// TestWeightedJaccardKeywords tests that common keywords get reduced weight
+func TestWeightedJaccardKeywords(t *testing.T) {
+	// Two functions with mostly keywords differing
+	tokens1 := []string{"if", "else", "return", "for", "while", "myFunction"}
+	tokens2 := []string{"switch", "case", "break", "try", "catch", "myFunction"}
+
+	weighted := calculateWeightedJaccard(tokens1, tokens2)
+	basic := calculateJaccard(tokens1, tokens2)
+
+	// Weighted should give more importance to "myFunction" which matches
+	if weighted <= basic {
+		t.Errorf("weighted (%f) should be higher than basic (%f) when only unique token matches", weighted, basic)
+	}
+}
+
+// TestWeightedJaccardWithFrequency tests that token frequency is considered
+func TestWeightedJaccardWithFrequency(t *testing.T) {
+	// Same token appearing multiple times
+	tokens1 := []string{"foo", "foo", "foo", "bar"}
+	tokens2 := []string{"foo", "foo", "bar", "bar"}
+
+	result := calculateWeightedJaccard(tokens1, tokens2)
+
+	// Should have reasonable similarity since they share tokens
+	if result < 0.5 || result > 1.0 {
+		t.Errorf("expected reasonable similarity for overlapping tokens, got %f", result)
+	}
+}
+
+// TestCommonKeywordsMap tests that the commonKeywords map contains expected values
+func TestCommonKeywordsMap(t *testing.T) {
+	expectedKeywords := []string{
+		"if", "else", "for", "while", "return",
+		"var", "let", "const", "function", "class",
+		"int", "string", "bool", "true", "false",
+		"import", "export", "package",
+	}
+
+	for _, kw := range expectedKeywords {
+		if !commonKeywords[kw] {
+			t.Errorf("expected %q to be in commonKeywords map", kw)
+		}
+	}
+}
+
+// BenchmarkCalculateWeightedJaccard benchmarks weighted Jaccard calculation
+func BenchmarkCalculateWeightedJaccard(b *testing.B) {
+	tokens1 := tokenize(`def foo(): return calculate_something() with multiple tokens here`)
+	tokens2 := tokenize(`def foo(): return calculate_something() with different tokens here`)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		calculateWeightedJaccard(tokens1, tokens2)
+	}
+}

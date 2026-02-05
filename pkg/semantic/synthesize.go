@@ -182,7 +182,7 @@ func AnalyzeConflictForSynthesis(file string) *SynthesisAnalysis {
 		localDef := localDefs[name]
 		remoteDef := remoteDefs[name]
 
-		conflict := analyzeSynthesisConflict(file, name, baseDef, localDef, remoteDef)
+		conflict := analyzeSynthesisConflict(file, name, baseDef, localDef, remoteDef, result.Language)
 		if conflict != nil {
 			result.Conflicts = append(result.Conflicts, *conflict)
 		}
@@ -195,7 +195,7 @@ func AnalyzeConflictForSynthesis(file string) *SynthesisAnalysis {
 }
 
 // analyzeSynthesisConflict determines conflict type and preserves definition data
-func analyzeSynthesisConflict(file, name string, base, local, remote *Definition) *SynthesisConflict {
+func analyzeSynthesisConflict(file, name string, base, local, remote *Definition, lang Language) *SynthesisConflict {
 	// Determine the kind
 	kind := "definition"
 	if local != nil {
@@ -208,16 +208,16 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 
 	kindStr := capitalizeFirst(kind)
 
-	// Normalize bodies for semantic comparison
+	// Normalize bodies for semantic comparison (language-aware: strips comments, normalizes whitespace)
 	var baseNorm, localNorm, remoteNorm string
 	if base != nil {
-		baseNorm = normalize(base.Body)
+		baseNorm = normalizeForLanguage(base.Body, lang)
 	}
 	if local != nil {
-		localNorm = normalize(local.Body)
+		localNorm = normalizeForLanguage(local.Body, lang)
 	}
 	if remote != nil {
-		remoteNorm = normalize(remote.Body)
+		remoteNorm = normalizeForLanguage(remote.Body, lang)
 	}
 
 	// Case 1: Added in both branches (didn't exist in base)
@@ -260,13 +260,21 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 		}
 	}
 
-	// Case 1c: Added only in remote (orphan add - for move detection)
+	// Case 1c: Added only in remote
+	// Top-level additions (no dot in name) can be auto-merged by appending
+	// Methods/nested definitions (dot in name) need manual resolution since
+	// they must be inserted inside their parent structure
 	if base == nil && local == nil && remote != nil {
+		status := "Can Auto-merge"
+		if strings.Contains(name, ".") {
+			// This is a method or nested definition - can't auto-append
+			status = "Needs Resolution"
+		}
 		return &SynthesisConflict{
 			UIConflict: ui.Conflict{
 				File:         file,
 				ConflictType: fmt.Sprintf("%s '%s' Added (remote)", kindStr, name),
-				Status:       "Needs Resolution",
+				Status:       status,
 			},
 			Local:  nil,
 			Remote: remote,
@@ -276,19 +284,21 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 
 	// Case 2: Removed in one branch, modified in other
 	if base != nil {
-		// Deleted on both branches (orphan delete - for move detection)
+		// Deleted on both branches - this is actually agreement, auto-mergeable
+		// (unless move detection later matches it with an add)
 		if local == nil && remote == nil {
 			return &SynthesisConflict{
 				UIConflict: ui.Conflict{
 					File:         file,
-					ConflictType: fmt.Sprintf("%s '%s' Deleted", kindStr, name),
-					Status:       "Needs Resolution",
+					ConflictType: fmt.Sprintf("%s '%s' Deleted (both)", kindStr, name),
+					Status:       "Can Auto-merge",
 				},
 				Local:  nil,
 				Remote: nil,
 				Base:   base,
 			}
 		}
+		// Deleted locally, modified remotely - conflict
 		if local == nil && remote != nil && remoteNorm != baseNorm {
 			return &SynthesisConflict{
 				UIConflict: ui.Conflict{
@@ -301,6 +311,20 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 				Base:   base,
 			}
 		}
+		// Deleted locally, unchanged remotely - auto-merge (accept deletion)
+		if local == nil && remote != nil && remoteNorm == baseNorm {
+			return &SynthesisConflict{
+				UIConflict: ui.Conflict{
+					File:         file,
+					ConflictType: fmt.Sprintf("%s '%s' Deleted (local)", kindStr, name),
+					Status:       "Can Auto-merge",
+				},
+				Local:  nil,
+				Remote: remote,
+				Base:   base,
+			}
+		}
+		// Deleted remotely, modified locally - conflict
 		if remote == nil && local != nil && localNorm != baseNorm {
 			return &SynthesisConflict{
 				UIConflict: ui.Conflict{
@@ -313,14 +337,31 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 				Base:   base,
 			}
 		}
+		// Deleted remotely, unchanged locally - auto-merge (accept deletion)
+		if remote == nil && local != nil && localNorm == baseNorm {
+			return &SynthesisConflict{
+				UIConflict: ui.Conflict{
+					File:         file,
+					ConflictType: fmt.Sprintf("%s '%s' Deleted (remote)", kindStr, name),
+					Status:       "Can Auto-merge",
+				},
+				Local:  local,
+				Remote: nil,
+				Base:   base,
+			}
+		}
 	}
 
 	// Case 3: Modified in both branches
 	if base != nil && local != nil && remote != nil {
-		localChanged := localNorm != baseNorm
-		remoteChanged := remoteNorm != baseNorm
+		// Check for textual changes first (including comment changes)
+		localTextChanged := local.Body != base.Body
+		remoteTextChanged := remote.Body != base.Body
+		// Check for semantic changes (code logic changes, ignoring comments/formatting)
+		localSemanticChanged := localNorm != baseNorm
+		remoteSemanticChanged := remoteNorm != baseNorm
 
-		if localChanged && remoteChanged {
+		if localTextChanged && remoteTextChanged {
 			// Check if bodies are exactly identical
 			if local.Body == remote.Body {
 				return &SynthesisConflict{
@@ -334,12 +375,20 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 					Base:   base,
 				}
 			}
-			// Check if semantically identical but different formatting
+			// Check if semantically identical but different formatting/comments
 			if localNorm == remoteNorm {
+				// Determine if the difference is only in comments
+				localBasic := normalize(local.Body)
+				remoteBasic := normalize(remote.Body)
+				conflictType := fmt.Sprintf("%s '%s' Formatted Change", kindStr, name)
+				if localBasic != remoteBasic {
+					// Basic normalization differs but language-aware is same = comment-only change
+					conflictType = fmt.Sprintf("%s '%s' Comment Change", kindStr, name)
+				}
 				return &SynthesisConflict{
 					UIConflict: ui.Conflict{
 						File:         file,
-						ConflictType: fmt.Sprintf("%s '%s' Formatted Change", kindStr, name),
+						ConflictType: conflictType,
 						Status:       "Can Auto-merge",
 					},
 					Local:  local,
@@ -359,12 +408,26 @@ func analyzeSynthesisConflict(file, name string, base, local, remote *Definition
 			}
 		}
 
-		// Only remote changed - auto-mergeable
-		if remoteChanged && !localChanged {
+		// Only remote changed semantically - auto-mergeable
+		if remoteSemanticChanged && !localSemanticChanged {
 			return &SynthesisConflict{
 				UIConflict: ui.Conflict{
 					File:         file,
 					ConflictType: fmt.Sprintf("%s '%s' Updated (remote)", kindStr, name),
+					Status:       "Can Auto-merge",
+				},
+				Local:  local,
+				Remote: remote,
+				Base:   base,
+			}
+		}
+
+		// Only local changed semantically - auto-mergeable (keep local as-is)
+		if localSemanticChanged && !remoteSemanticChanged {
+			return &SynthesisConflict{
+				UIConflict: ui.Conflict{
+					File:         file,
+					ConflictType: fmt.Sprintf("%s '%s' Updated (local)", kindStr, name),
 					Status:       "Can Auto-merge",
 				},
 				Local:  local,
@@ -503,6 +566,36 @@ func getConflictEndByte(conflict *SynthesisConflict) uint32 {
 
 // applyAutoMerge replaces the local definition with the remote one
 func applyAutoMerge(canvas []byte, conflict *SynthesisConflict) []byte {
+	// Case: Deleted (both) - both branches deleted, nothing exists in canvas
+	// Just return canvas as-is (deletion already happened)
+	if conflict.Local == nil && conflict.Remote == nil && conflict.Base != nil {
+		return canvas
+	}
+
+	// Case: Deleted (local) - local deleted, remote unchanged
+	// Canvas already doesn't have it, keep as-is
+	if conflict.Local == nil && conflict.Remote != nil && conflict.Base != nil {
+		localNorm := normalize(conflict.Base.Body)
+		remoteNorm := normalize(conflict.Remote.Body)
+		if localNorm == remoteNorm {
+			// Remote unchanged, local deletion accepted - nothing to do
+			return canvas
+		}
+	}
+
+	// Case: Deleted (remote) - remote deleted, local unchanged
+	// Need to delete from canvas to accept remote's deletion
+	if conflict.Local != nil && conflict.Remote == nil && conflict.Base != nil {
+		localNorm := normalize(conflict.Local.Body)
+		baseNorm := normalize(conflict.Base.Body)
+		if localNorm == baseNorm {
+			// Local unchanged, accept remote deletion by removing from canvas
+			startByte := conflict.Local.StartByte
+			endByte := conflict.Local.EndByte
+			return replaceBytes(canvas, startByte, endByte, []byte{})
+		}
+	}
+
 	// For identical additions or modifications where both sides are the same,
 	// we keep local (no change needed)
 	if conflict.Local != nil && conflict.Remote != nil {
@@ -510,6 +603,17 @@ func applyAutoMerge(canvas []byte, conflict *SynthesisConflict) []byte {
 		remoteNorm := normalize(conflict.Remote.Body)
 		if localNorm == remoteNorm {
 			// Already identical, keep as-is
+			return canvas
+		}
+	}
+
+	// Case: Updated (local) - local changed, remote unchanged from base
+	// Keep local as-is (canvas already has local changes)
+	if conflict.Local != nil && conflict.Remote != nil && conflict.Base != nil {
+		remoteNorm := normalize(conflict.Remote.Body)
+		baseNorm := normalize(conflict.Base.Body)
+		if remoteNorm == baseNorm {
+			// Remote unchanged from base, local has the changes - keep canvas
 			return canvas
 		}
 	}
@@ -523,7 +627,7 @@ func applyAutoMerge(canvas []byte, conflict *SynthesisConflict) []byte {
 		return replaceBytes(canvas, startByte, endByte, newBody)
 	}
 
-	// Move conflict: Local is nil (deleted), Remote has the renamed function
+	// Move conflict / Orphan add: Local is nil, Remote has the content
 	// Append the remote content to the end of the file
 	if conflict.Local == nil && conflict.Remote != nil {
 		// Ensure we have a newline before appending
@@ -655,9 +759,24 @@ func detectCollisions(conflicts []SynthesisConflict) []RangeCollision {
 		return nil
 	}
 
+	// Filter out orphan adds (Local and Base both nil) - they don't occupy canvas space
+	// and shouldn't be considered for collision detection
+	var filtered []SynthesisConflict
+	for _, c := range conflicts {
+		if c.Local == nil && c.Base == nil {
+			// Orphan add - skip from collision detection
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+
+	if len(filtered) < 2 {
+		return nil
+	}
+
 	// Sort by StartByte ascending for collision detection
-	sorted := make([]SynthesisConflict, len(conflicts))
-	copy(sorted, conflicts)
+	sorted := make([]SynthesisConflict, len(filtered))
+	copy(sorted, filtered)
 	sort.Slice(sorted, func(i, j int) bool {
 		return getConflictStartByte(&sorted[i]) < getConflictStartByte(&sorted[j])
 	})
@@ -896,7 +1015,7 @@ func AnalyzeConflictFromContents(filePath string, baseContent, localContent, rem
 		localDef := localDefs[name]
 		remoteDef := remoteDefs[name]
 
-		conflict := analyzeSynthesisConflict(filePath, name, baseDef, localDef, remoteDef)
+		conflict := analyzeSynthesisConflict(filePath, name, baseDef, localDef, remoteDef, result.Language)
 		if conflict != nil {
 			result.Conflicts = append(result.Conflicts, *conflict)
 		}
